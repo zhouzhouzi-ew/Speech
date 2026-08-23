@@ -1,0 +1,89 @@
+model:
+  n_input_features: 256 # number of input features in the neural data. (1 feature per electrode (TC only), 256 electrodes)
+  n_units: 768 # number of units per GRU layer
+  rnn_dropout: 0.4 # dropout rate for the GRU layers
+  rnn_trainable: true # whether the GRU layers are trainable
+  n_layers: 5 # number of GRU layers
+  patch_size: 14 # size of the input patches (14 time steps)
+  patch_stride: 4 # stride for the input patches (4 time steps)
+
+  input_network:
+    n_input_layers: 1 # number of input layers per network (one network for each day)
+    input_layer_sizes:
+    - 256 # size of the input layer (number of input features)
+    input_trainable: true # whether the input layer is trainable
+    input_layer_dropout: 0.2 # dropout rate for the input layer
+
+gpu_number: '1' # GPU number to use for training, formatted as a string (e.g., '0', '1', etc.)
+mode: train
+use_amp: true # whether to use automatic mixed precision (AMP) for training
+
+output_dir: trained_models/baseline_rnn # directory to save the trained model and logs
+checkpoint_dir: trained_models/baseline_rnn/checkpoint # directory to save checkpoints during training
+init_from_checkpoint: false # whether to initialize the model from a checkpoint
+init_checkpoint_path: None # path to the checkpoint to initialize the model from, if any
+save_best_checkpoint: true # whether to save the best checkpoint based on validation metrics
+save_all_val_steps: false # whether to save checkpoints at all validation steps
+save_final_model: false # whether to save the final model after training
+save_val_metrics: true # whether to save validation metrics during training
+early_stopping: false # whether to use early stopping based on validation metrics
+early_stopping_val_steps: 20 # number of validation steps to wait before stopping training if no improvement is seen
+
+num_training_batches: 2000 # number of training batches to run (paper Day 8-13: 2,000-50,000; 2k ~ 750 epochs over 171 train trials)
+lr_scheduler_type: cosine # type of learning rate scheduler to use
+lr_max: 0.005 # maximum learning rate for the main model
+lr_min: 0.0001 # minimum learning rate for the main model
+lr_decay_steps: 2000 # number of steps for the learning rate decay
+lr_warmup_steps: 200 # number of warmup steps for the learning rate scheduler (10% of total)
+lr_max_day: 0.005 # maximum learning rate for the day specific input layers
+lr_min_day: 0.0001 # minimum learning rate for the day specific input layers
+lr_decay_steps_day: 2000 # number of steps for the learning rate decay for the day specific input layers
+lr_warmup_steps_day: 200 # number of warmup steps for the learning rate scheduler for the day specific input layers
+
+beta0: 0.9 # beta0 parameter for the Adam optimizer
+beta1: 0.999 # beta1 parameter for the Adam optimizer
+epsilon: 0.1 # epsilon parameter for the Adam optimizer
+weight_decay: 0.001 # weight decay for the main model
+weight_decay_day: 0 # weight decay for the day specific input layers
+seed: 10 # random seed for reproducibility
+grad_norm_clip_value: 10 # gradient norm clipping value
+
+batches_per_train_log: 200 # number of batches per training log
+batches_per_val_step: 500 # number of batches per validation step (with 2k total: val at 500/1000/1500/2000)
+
+batches_per_save: 0 # number of batches per save
+log_individual_day_val_PER: true # whether to log individual day validation performance
+log_val_skip_logs: false # whether to skip logging validation metrics
+save_val_logits: true # whether to save validation logits
+save_val_data: false # whether to save validation data
+
+dataset:
+  data_transforms:
+    white_noise_std: 1.0 # standard deviation of the white noise added to the data
+    constant_offset_std: 0.2 # standard deviation of the constant offset added to the data
+    random_walk_std: 0.0 # standard deviation of the random walk added to the data
+    random_walk_axis: -1 # axis along which the random walk is applied
+    static_gain_std: 0.0 # standard deviation of the static gain applied to the data
+    random_cut: 3 # number of time steps to randomly cut from the beginning of each batch of trials
+    smooth_kernel_size: 100 # size of the smoothing kernel applied to the data
+    smooth_data: true # whether to smooth the data
+    smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
+
+  neural_dim: 256 # dimensionality of the neural data
+  batch_size: 64 # batch size for training
+  n_classes: 35 # number of classes in the dataset (CTC blank + 33 phonemes + SIL)
+  max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
+  days_per_batch: 1 # number of randomly-selected days to include in each batch
+  seed: 1 # random seed for reproducibility
+  num_dataloader_workers: 4 # number of workers for the data loader
+  loader_shuffle: false # whether to shuffle the data loader
+  must_include_days: null # specific days to include in the dataset
+  test_percentage: 0.1 # percentage of data to use for testing
+  feature_subset: null # specific features to include in the dataset
+
+  dataset_dir: ../data/hdf5_data_final # directory containing the dataset
+  bad_trials_dict: null # dictionary of bad trials to exclude from the dataset
+  sessions: # list of sessions to include in the dataset
+  - t15.2026.08.01
+  dataset_probability_val: # probability of including a trial in the validation set (0 or 1)
+  - 1

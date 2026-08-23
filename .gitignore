@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Models / checkpoints
+model_training/trained_models/
+
+# Runtime build artifacts
+language_model/runtime/server/x86/build/
+language_model/runtime/server/x86/fc_base/
+*.so
+
+# Large generated HDF5 data
+*.hdf5
+*.h5
+
+# Generated LM build outputs
+language_model/examples/speech/s0/t15_2026_08_01_3gram/
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+*.bak_*

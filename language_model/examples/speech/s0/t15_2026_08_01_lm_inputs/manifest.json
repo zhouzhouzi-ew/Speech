@@ -1,0 +1,9 @@
+{
+  "excel_path": "语言解码复现实验_诊断Block与50词句子.xlsx",
+  "dict_source_path": "nejm-brain-to-text_self\\language_model\\examples\\speech\\s0\\t15_lm\\dict",
+  "output_dir": "nejm-brain-to-text_self\\language_model\\examples\\speech\\s0\\t15_2026_08_01_lm_inputs",
+  "vocab_size": 50,
+  "sentence_count": 189,
+  "dict_path": "nejm-brain-to-text_self\\language_model\\examples\\speech\\s0\\t15_2026_08_01_lm_inputs\\dict",
+  "corpus_path": "nejm-brain-to-text_self\\language_model\\examples\\speech\\s0\\t15_2026_08_01_lm_inputs\\corpus.txt"
+}
