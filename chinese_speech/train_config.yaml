@@ -13,8 +13,8 @@ data:
 model:
   n_units: 768
   n_layers: 5
-  rnn_dropout: 0.4
-  input_dropout: 0.2
+  rnn_dropout: 0.6
+  input_dropout: 0.35
   patch_size: 14
   patch_stride: 4
 
@@ -23,6 +23,7 @@ training:
   learning_rate: 0.001
   weight_decay: 0.001
   tone_weight: 1.0
+  checkpoint_metric: syllable_tone_per
   grad_norm_clip: 10.0
   smooth_data: true
   smooth_kernel_std: 2.0

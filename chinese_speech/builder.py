@@ -5,10 +5,9 @@ import csv
 import json
 import math
 import shutil
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -46,44 +45,13 @@ class TaskTrial:
     condition: str
 
 
-class RollingChannelStats:
-    def __init__(self, n_channels: int, max_trials: int):
-        self.n_channels = n_channels
-        self.max_trials = max_trials
-        self.entries: Deque[Tuple[np.ndarray, np.ndarray, int]] = deque()
-        self.total_sum = np.zeros(n_channels, dtype=np.float64)
-        self.total_sumsq = np.zeros(n_channels, dtype=np.float64)
-        self.total_count = 0
-
-    def push(self, features: np.ndarray) -> None:
-        arr = np.asarray(features, dtype=np.float64)
-        sums = arr.sum(axis=0)
-        sumsq = np.square(arr).sum(axis=0)
-        n_rows = int(arr.shape[0])
-        self.entries.append((sums, sumsq, n_rows))
-        self.total_sum += sums
-        self.total_sumsq += sumsq
-        self.total_count += n_rows
-        while len(self.entries) > self.max_trials:
-            old_sum, old_sumsq, old_n = self.entries.popleft()
-            self.total_sum -= old_sum
-            self.total_sumsq -= old_sumsq
-            self.total_count -= old_n
-
-    def has_history(self) -> bool:
-        return self.total_count > 0
-
-    def mean_std(self) -> Tuple[np.ndarray, np.ndarray]:
-        if self.total_count <= 0:
-            return (
-                np.zeros(self.n_channels, dtype=np.float32),
-                np.ones(self.n_channels, dtype=np.float32),
-            )
-        mean = self.total_sum / self.total_count
-        var = self.total_sumsq / self.total_count - mean**2
-        std = np.sqrt(np.maximum(var, 1e-8))
-        std = np.maximum(std, STD_FLOOR)
-        return mean.astype(np.float32), std.astype(np.float32)
+@dataclass(frozen=True)
+class NormalizationStats:
+    date: str
+    n_trials: int
+    n_samples: int
+    mean: np.ndarray
+    std: np.ndarray
 
 
 def discover_chinese_sessions(root: Path) -> List[ChineseSession]:
@@ -186,6 +154,25 @@ def _membership_from_electrodes(
     return membership, dead_electrodes, valid_cols
 
 
+def _electrode_features_for_trial(
+    *,
+    spike_bin: h5py.Dataset,
+    valid_cols: np.ndarray,
+    membership: np.ndarray,
+    start: int,
+    end: int,
+    trial_num: int,
+) -> Tuple[np.ndarray, int]:
+    raw_slice = np.asarray(spike_bin[start:end, :], dtype=np.float32)[:, valid_cols]
+    n_raw = raw_slice.shape[0]
+    n_bins = n_raw // BIN_SIZE_MS
+    if n_bins <= 0:
+        raise ValueError(f"Trial {trial_num} has no complete 20 ms bins.")
+    raw_slice = raw_slice[: n_bins * BIN_SIZE_MS]
+    binned_units = raw_slice.reshape(n_bins, BIN_SIZE_MS, valid_cols.size).sum(axis=1)
+    return binned_units @ membership, int(n_bins)
+
+
 def _encode_transcription(text: str) -> np.ndarray:
     return np.frombuffer(text.encode("utf-8") + b"\0", dtype=np.uint8)
 
@@ -209,6 +196,91 @@ def _is_included_trial(
     if _is_diagnostic_trial(trial):
         return include_diagnostic_trials
     return trial.condition == "speech"
+
+
+def _included_trials(
+    trials: Sequence[TaskTrial],
+    *,
+    include_blank_trials: bool,
+    include_diagnostic_trials: bool,
+) -> List[TaskTrial]:
+    return [
+        trial
+        for trial in trials
+        if _is_included_trial(
+            trial,
+            include_blank_trials=include_blank_trials,
+            include_diagnostic_trials=include_diagnostic_trials,
+        )
+    ]
+
+
+def compute_normalization_stats_by_date(
+    sessions: Sequence[ChineseSession],
+    *,
+    n_electrodes: int = N_ELECTRODES,
+    include_blank_trials: bool = False,
+    include_diagnostic_trials: bool = False,
+    calibration_trials: int = HISTORY_TRIALS,
+) -> Dict[str, NormalizationStats]:
+    if calibration_trials <= 0:
+        raise ValueError("calibration_trials must be positive")
+
+    features_by_date: Dict[str, List[np.ndarray]] = {}
+    for session in sorted(sessions, key=lambda item: item.session_name):
+        date = session.session_name[:10]
+        if len(features_by_date.get(date, [])) >= calibration_trials:
+            continue
+
+        task_trials = _included_trials(
+            load_task_trials(session.csv_path),
+            include_blank_trials=include_blank_trials,
+            include_diagnostic_trials=include_diagnostic_trials,
+        )
+        if not task_trials:
+            continue
+
+        with h5py.File(session.trial_data_path, "r") as raw:
+            membership, _dead_electrodes, valid_cols = _membership_from_electrodes(
+                raw["array_channel_unit"][:],
+                raw["neuron_mask"][:],
+                n_electrodes,
+            )
+            spike_bin = raw["spike_bin"]
+            trial_bounds = _build_trial_bounds(raw["trial_mask"][:])
+            windows = _read_windows(raw["state_bin"][:], trial_bounds)
+            collected = features_by_date.setdefault(date, [])
+
+            for trial in task_trials:
+                if len(collected) >= calibration_trials:
+                    break
+                if trial.trial_num not in windows:
+                    raise ValueError(f"CSV trial {trial.trial_num} not present in trial_mask.")
+                start, end = windows[trial.trial_num]
+                features, _n_bins = _electrode_features_for_trial(
+                    spike_bin=spike_bin,
+                    valid_cols=valid_cols,
+                    membership=membership,
+                    start=start,
+                    end=end,
+                    trial_num=trial.trial_num,
+                )
+                collected.append(features.astype(np.float32))
+
+    stats_by_date: Dict[str, NormalizationStats] = {}
+    for date, feature_list in features_by_date.items():
+        if not feature_list:
+            continue
+        stacked = np.concatenate(feature_list, axis=0).astype(np.float64)
+        std = np.maximum(stacked.std(axis=0), STD_FLOOR)
+        stats_by_date[date] = NormalizationStats(
+            date=date,
+            n_trials=len(feature_list),
+            n_samples=int(stacked.shape[0]),
+            mean=stacked.mean(axis=0).astype(np.float32),
+            std=std.astype(np.float32),
+        )
+    return stats_by_date
 
 
 def _split_trials(
@@ -244,6 +316,7 @@ class ChineseSpeechBuilder:
         test_fraction: float = 0.1,
         include_blank_trials: bool = False,
         include_diagnostic_trials: bool = False,
+        normalization_stats: Optional[NormalizationStats] = None,
         overwrite: bool = False,
         n_electrodes: int = N_ELECTRODES,
     ) -> None:
@@ -255,6 +328,7 @@ class ChineseSpeechBuilder:
         self.test_fraction = test_fraction
         self.include_blank_trials = include_blank_trials
         self.include_diagnostic_trials = include_diagnostic_trials
+        self.normalization_stats = normalization_stats
         self.overwrite = overwrite
         self.n_electrodes = n_electrodes
 
@@ -269,17 +343,36 @@ class ChineseSpeechBuilder:
     def build(self) -> Dict[str, object]:
         lexicon = load_default_pronunciation_lexicon()
         task_trials = load_task_trials(self.csv_path)
-        labeled_trials = [
-            trial
-            for trial in task_trials
-            if _is_included_trial(
-                trial,
+        labeled_trials = _included_trials(
+            task_trials,
+            include_blank_trials=self.include_blank_trials,
+            include_diagnostic_trials=self.include_diagnostic_trials,
+        )
+        if not labeled_trials:
+            raise ValueError(f"No included speech trials found in {self.session_dir}")
+        normalization_stats = self.normalization_stats
+        if normalization_stats is None:
+            session = ChineseSession(
+                session_name=self.session_dir.name,
+                session_dir=self.session_dir,
+                csv_path=self.csv_path,
+                trial_data_path=self.trial_data_path,
+                config_path=None,
+            )
+            stats_by_date = compute_normalization_stats_by_date(
+                [session],
+                n_electrodes=self.n_electrodes,
                 include_blank_trials=self.include_blank_trials,
                 include_diagnostic_trials=self.include_diagnostic_trials,
             )
-        ]
-        if not labeled_trials:
-            raise ValueError(f"No included speech trials found in {self.session_dir}")
+            normalization_stats = stats_by_date.get(self.session_dir.name[:10])
+        if normalization_stats is None:
+            raise ValueError(f"No z-score calibration trials found for {self.session_dir.name[:10]}")
+        if normalization_stats.mean.shape[-1] != self.n_electrodes:
+            raise ValueError(
+                f"Normalization stats have {normalization_stats.mean.shape[-1]} channels, "
+                f"but builder expected {self.n_electrodes}."
+            )
         schema = LabelSchema.from_texts([trial.text for trial in labeled_trials if trial.text], lexicon)
         split_by_trial = _split_trials(
             labeled_trials,
@@ -300,7 +393,6 @@ class ChineseSpeechBuilder:
         manifest_rows: List[Dict[str, object]] = []
         read_bins: List[int] = []
         max_abs_z = 0.0
-        raw_first_trials = 0
 
         try:
             with h5py.File(self.trial_data_path, "r") as raw:
@@ -313,7 +405,6 @@ class ChineseSpeechBuilder:
                 trial_bounds = _build_trial_bounds(raw["trial_mask"][:])
                 windows = _read_windows(raw["state_bin"][:], trial_bounds)
 
-                rolling = RollingChannelStats(self.n_electrodes, HISTORY_TRIALS)
                 for task_trial in task_trials:
                     if _is_diagnostic_trial(task_trial) and not self.include_diagnostic_trials:
                         manifest_rows.append(
@@ -351,25 +442,22 @@ class ChineseSpeechBuilder:
                     if task_trial.trial_num not in windows:
                         raise ValueError(f"CSV trial {task_trial.trial_num} not present in trial_mask.")
                     start, end = windows[task_trial.trial_num]
-                    raw_slice = np.asarray(spike_bin[start:end, :], dtype=np.float32)[:, valid_cols]
-                    n_raw = raw_slice.shape[0]
-                    n_bins = n_raw // BIN_SIZE_MS
-                    if n_bins <= 0:
-                        raise ValueError(f"Trial {task_trial.trial_num} has no complete 20 ms bins.")
-                    raw_slice = raw_slice[: n_bins * BIN_SIZE_MS]
-                    binned_units = raw_slice.reshape(n_bins, BIN_SIZE_MS, valid_cols.size).sum(axis=1)
-                    electrode_features = binned_units @ membership
+                    electrode_features, n_bins = _electrode_features_for_trial(
+                        spike_bin=spike_bin,
+                        valid_cols=valid_cols,
+                        membership=membership,
+                        start=start,
+                        end=end,
+                        trial_num=task_trial.trial_num,
+                    )
                     split = split_by_trial[task_trial.trial_num]
 
-                    if rolling.has_history():
-                        mean, std = rolling.mean_std()
-                        features = np.clip((electrode_features - mean) / std, -Z_CLIP, Z_CLIP)
-                        max_abs_z = max(max_abs_z, float(np.abs(features).max()))
-                    else:
-                        features = electrode_features
-                        raw_first_trials += 1
-                    if split != "test":
-                        rolling.push(electrode_features)
+                    features = np.clip(
+                        (electrode_features - normalization_stats.mean) / normalization_stats.std,
+                        -Z_CLIP,
+                        Z_CLIP,
+                    )
+                    max_abs_z = max(max_abs_z, float(np.abs(features).max()))
                     read_bins.append(int(n_bins))
 
                     if task_trial.text:
@@ -403,7 +491,7 @@ class ChineseSpeechBuilder:
                     group.attrs["seq_len"] = len(encoded.syllable_ids)
                     group.attrs["tone_seq_len"] = len(encoded.tone_ids)
                     group.attrs["feature_type"] = (
-                        "syllable_tone_electrode_zscore_prev20_non_test_statebin_read_"
+                        "syllable_tone_electrode_zscore_fixed_day_first20_statebin_read_"
                         "stdfloor0.05_clip20"
                     )
                     group.attrs["pronunciation"] = _pronunciation_string(encoded.pronunciation)
@@ -436,10 +524,10 @@ class ChineseSpeechBuilder:
             n_task_trials=len(task_trials),
             n_labeled_trials=len(labeled_trials),
             n_diagnostic_trials=sum(1 for trial in task_trials if _is_diagnostic_trial(trial)),
+            normalization_stats=normalization_stats,
             split_counts=split_counts,
             dead_electrodes=dead_electrodes,
             read_bins=read_bins,
-            raw_first_trials=raw_first_trials,
             max_abs_z=max_abs_z,
         )
 
@@ -482,10 +570,10 @@ class ChineseSpeechBuilder:
         n_task_trials: int,
         n_labeled_trials: int,
         n_diagnostic_trials: int,
+        normalization_stats: NormalizationStats,
         split_counts: Mapping[str, int],
         dead_electrodes: Sequence[int],
         read_bins: Sequence[int],
-        raw_first_trials: int,
         max_abs_z: float,
     ) -> Dict[str, object]:
         metadata = {
@@ -520,7 +608,10 @@ class ChineseSpeechBuilder:
                 "dead_electrodes": list(dead_electrodes),
                 "bin_size_ms": BIN_SIZE_MS,
                 "read_window": "state_bin==2",
-                "normalization": "causal_prev20_read_epochs_previous_non_test_trials_train_val_history",
+                "normalization": "fixed_first20_included_trials_per_day_all_splits",
+                "normalization_date": normalization_stats.date,
+                "normalization_reference_trials": int(normalization_stats.n_trials),
+                "normalization_reference_samples": int(normalization_stats.n_samples),
                 "smoothing": "none_in_preprocessing",
             },
             "labels": {
@@ -534,13 +625,13 @@ class ChineseSpeechBuilder:
                 "seq_class_ids_alias": "seq_syllable_ids",
                 "english_compatible": "seq_class_ids is present as the syllable stream only; use dual-stream training for tone.",
             },
-            "roll_stats": {
+            "zscore_stats": {
                 "read_bins_per_trial": {
                     "min": int(np.min(read_bins)) if read_bins else 0,
                     "mean": float(np.mean(read_bins)) if read_bins else 0.0,
                     "max": int(np.max(read_bins)) if read_bins else 0,
                 },
-                "z_raw_first_trials": int(raw_first_trials),
+                "z_reference_trials": int(normalization_stats.n_trials),
                 "max_abs_z": float(max_abs_z),
             },
         }
@@ -559,7 +650,13 @@ def build_all_sessions(
     include_diagnostic_trials: bool = False,
 ) -> List[Dict[str, object]]:
     results = []
-    for session in discover_chinese_sessions(speech_root):
+    sessions = discover_chinese_sessions(speech_root)
+    stats_by_date = compute_normalization_stats_by_date(
+        sessions,
+        include_blank_trials=include_blank_trials,
+        include_diagnostic_trials=include_diagnostic_trials,
+    )
+    for session in sessions:
         task_trials = load_task_trials(session.csv_path)
         if not any(
             _is_included_trial(
@@ -576,6 +673,7 @@ def build_all_sessions(
             split_seed=split_seed,
             include_blank_trials=include_blank_trials,
             include_diagnostic_trials=include_diagnostic_trials,
+            normalization_stats=stats_by_date.get(session.session_name[:10]),
             overwrite=overwrite,
         )
         results.append(builder.build())
@@ -603,7 +701,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    sessions = discover_chinese_sessions(args.speech_root)
+    all_sessions = discover_chinese_sessions(args.speech_root)
+    sessions = all_sessions
     if args.session is not None:
         sessions = [session for session in sessions if session.session_name == args.session]
     if not sessions:
@@ -631,6 +730,11 @@ def main() -> None:
         return
 
     args.output_root.mkdir(parents=True, exist_ok=True)
+    stats_by_date = compute_normalization_stats_by_date(
+        all_sessions,
+        include_blank_trials=args.include_blank_trials,
+        include_diagnostic_trials=args.include_diagnostic_trials,
+    )
     for session in sessions:
         task_trials = load_task_trials(session.csv_path)
         if not any(
@@ -649,6 +753,7 @@ def main() -> None:
             split_seed=args.seed,
             include_blank_trials=args.include_blank_trials,
             include_diagnostic_trials=args.include_diagnostic_trials,
+            normalization_stats=stats_by_date.get(session.session_name[:10]),
             overwrite=args.overwrite,
         ).build()
         counts = result["split_counts"]

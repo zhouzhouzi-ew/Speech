@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -106,6 +107,7 @@ def discover_session_dirs(hdf5_root: Path, sessions: object = "all") -> List[Pat
             and (path / "metadata.json").exists()
             and (path / "data_train.hdf5").exists()
             and (path / "data_val.hdf5").exists()
+            and (path / "data_test.hdf5").exists()
         ]
     else:
         if isinstance(sessions, str):
@@ -173,6 +175,15 @@ def _move_batch_to_device(batch: MutableMapping[str, object], device: torch.devi
         else:
             moved[key] = value
     return moved
+
+
+def _decode_token_labels(
+    ids: Sequence[int],
+    id_to_label: Mapping[int, str],
+    *,
+    ignore_ids: set[int],
+) -> List[str]:
+    return [str(id_to_label.get(int(item), f"<unk:{int(item)}>")) for item in ids if int(item) not in ignore_ids]
 
 
 def _loss_batch_with_adjusted_lengths(
@@ -304,6 +315,8 @@ def _evaluate(
 ) -> Dict[str, float]:
     model.eval()
     losses: List[float] = []
+    syllable_losses: List[float] = []
+    tone_losses: List[float] = []
     syllable_edits = 0
     syllable_total = 0
     tone_edits = 0
@@ -326,8 +339,10 @@ def _evaluate(
                 patch_size=patch_size,
                 patch_stride=patch_stride,
             )
-            loss, _ = dual_stream_ctc_loss(output, loss_batch, tone_weight=tone_weight)
+            loss, loss_parts = dual_stream_ctc_loss(output, loss_batch, tone_weight=tone_weight)
             losses.append(float(loss.detach().cpu()))
+            syllable_losses.append(float(loss_parts["syllable_loss"]))
+            tone_losses.append(float(loss_parts["tone_loss"]))
 
             valid_lengths = loss_batch["n_time_steps"].detach().cpu().tolist()
             for row_idx, valid_len in enumerate(valid_lengths):
@@ -372,6 +387,8 @@ def _evaluate(
 
     return {
         "loss": float(np.mean(losses)) if losses else math.inf,
+        "syllable_loss": float(np.mean(syllable_losses)) if syllable_losses else math.inf,
+        "tone_loss": float(np.mean(tone_losses)) if tone_losses else math.inf,
         "syllable_per": syllable_per,
         "tone_per": tone_per,
         "syllable_tone_per": syllable_tone_per,
@@ -488,12 +505,233 @@ def _ignore_ids(label_map: Mapping[str, int]) -> set[int]:
 
 def _print_eval_metrics(prefix: str, metrics: Mapping[str, float], *, batch: int | None = None) -> None:
     batch_part = "" if batch is None else f"batch={batch} "
-    print(
-        f"{batch_part}{prefix}_loss={metrics['loss']:.4f} "
-        f"{prefix}_syllable_per={metrics['syllable_per']:.4f} "
-        f"{prefix}_tone_per={metrics['tone_per']:.4f} "
-        f"{prefix}_syllable_tone_per={metrics['syllable_tone_per']:.4f}"
+    fields = [f"{batch_part}{prefix}_loss={metrics['loss']:.4f}"]
+    if "syllable_loss" in metrics and "tone_loss" in metrics:
+        fields.extend(
+            [
+                f"{prefix}_syllable_loss={metrics['syllable_loss']:.4f}",
+                f"{prefix}_tone_loss={metrics['tone_loss']:.4f}",
+            ]
+        )
+    fields.extend(
+        [
+            f"{prefix}_syllable_per={metrics['syllable_per']:.4f}",
+            f"{prefix}_tone_per={metrics['tone_per']:.4f}",
+            f"{prefix}_syllable_tone_per={metrics['syllable_tone_per']:.4f}",
+        ]
     )
+    print(" ".join(fields))
+
+
+def _is_better_checkpoint(
+    metrics: Mapping[str, float],
+    *,
+    best_value: float,
+    metric: str = "syllable_tone_per",
+) -> bool:
+    if metric not in metrics:
+        raise KeyError(f"Validation metrics do not contain checkpoint metric {metric!r}")
+    return float(metrics[metric]) < float(best_value)
+
+
+def _default_checkpoint_path(output_dir: str | Path) -> Path:
+    checkpoint_dir = Path(output_dir) / "checkpoints"
+    best = checkpoint_dir / "best.pt"
+    latest = checkpoint_dir / "latest.pt"
+    return best if best.exists() else latest
+
+
+def _checkpoint_payload(
+    *,
+    model: DualStreamGRUDecoder,
+    optimizer: torch.optim.Optimizer,
+    cfg: DictConfig,
+    label_maps: LabelMaps,
+    metrics: Mapping[str, object],
+    batch: int,
+    checkpoint_kind: str,
+) -> Dict[str, object]:
+    return {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "label_maps": {
+            "syllable_to_id": label_maps.syllable_to_id,
+            "tone_to_id": label_maps.tone_to_id,
+        },
+        "metrics": dict(metrics),
+        "batch": int(batch),
+        "checkpoint_kind": checkpoint_kind,
+    }
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    model: DualStreamGRUDecoder,
+    optimizer: torch.optim.Optimizer,
+    cfg: DictConfig,
+    label_maps: LabelMaps,
+    metrics: Mapping[str, object],
+    batch: int,
+    checkpoint_kind: str,
+) -> None:
+    torch.save(
+        _checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            cfg=cfg,
+            label_maps=label_maps,
+            metrics=metrics,
+            batch=batch,
+            checkpoint_kind=checkpoint_kind,
+        ),
+        path,
+    )
+
+
+def _prediction_rows(
+    *,
+    model: DualStreamGRUDecoder,
+    loader: DataLoader,
+    split: str,
+    device: torch.device,
+    patch_size: int,
+    patch_stride: int,
+    smooth_data: bool,
+    smooth_kernel_std: float,
+    smooth_kernel_size: int,
+    label_maps: LabelMaps,
+    syllable_ignore_ids: set[int],
+    tone_ignore_ids: set[int],
+) -> List[Dict[str, object]]:
+    id_to_syllable = {idx: label for label, idx in label_maps.syllable_to_id.items()}
+    id_to_tone = {idx: label for label, idx in label_maps.tone_to_id.items()}
+    rows: List[Dict[str, object]] = []
+    model.eval()
+    with torch.no_grad():
+        for raw_batch in loader:
+            batch = _move_batch_to_device(raw_batch, device)
+            features = batch["input_features"]
+            if smooth_data:
+                features = gaussian_smooth(
+                    features,
+                    smooth_kernel_std=smooth_kernel_std,
+                    smooth_kernel_size=smooth_kernel_size,
+                )
+            output = model(features, batch["day_indicies"])
+            adjusted_lengths = adjusted_input_lengths(
+                batch["n_time_steps"],
+                patch_size=patch_size,
+                patch_stride=patch_stride,
+            ).detach().cpu().tolist()
+
+            for row_idx, valid_len in enumerate(adjusted_lengths):
+                pred_syllables = _ctc_greedy(output["syllable_logits"][row_idx], int(valid_len))
+                pred_tones = _ctc_greedy(output["tone_logits"][row_idx], int(valid_len))
+                true_syllables = batch["seq_syllable_ids"][row_idx][
+                    : batch["syllable_seq_lens"][row_idx]
+                ].detach().cpu().tolist()
+                true_tones = batch["seq_tone_ids"][row_idx][
+                    : batch["tone_seq_lens"][row_idx]
+                ].detach().cpu().tolist()
+
+                syllable_edits, syllable_total = _token_error_counts(
+                    true_syllables,
+                    pred_syllables,
+                    ignore_ids=syllable_ignore_ids,
+                )
+                tone_edits, tone_total = _token_error_counts(
+                    true_tones,
+                    pred_tones,
+                    ignore_ids=tone_ignore_ids,
+                )
+                paired_edits, paired_total = _paired_token_error_counts(
+                    reference_syllables=true_syllables,
+                    reference_tones=true_tones,
+                    hypothesis_syllables=pred_syllables,
+                    hypothesis_tones=pred_tones,
+                    syllable_ignore_ids=syllable_ignore_ids,
+                    tone_ignore_ids=tone_ignore_ids,
+                )
+
+                rows.append(
+                    {
+                        "split": split,
+                        "session": raw_batch["session_names"][row_idx],
+                        "block_num": int(raw_batch["block_nums"][row_idx]),
+                        "trial_num": int(raw_batch["trial_nums"][row_idx]),
+                        "transcription": raw_batch["transcriptions"][row_idx],
+                        "true_syllables": " ".join(
+                            _decode_token_labels(true_syllables, id_to_syllable, ignore_ids=syllable_ignore_ids)
+                        ),
+                        "true_tones": " ".join(_decode_token_labels(true_tones, id_to_tone, ignore_ids=tone_ignore_ids)),
+                        "true_syllable_tone": " ".join(
+                            decode_dual_stream_pairs(
+                                syllable_ids=true_syllables,
+                                tone_ids=true_tones,
+                                id_to_syllable=id_to_syllable,
+                                id_to_tone=id_to_tone,
+                                syllable_ignore_ids=syllable_ignore_ids,
+                                tone_ignore_ids=tone_ignore_ids,
+                            )
+                        ),
+                        "pred_syllables": " ".join(
+                            _decode_token_labels(pred_syllables, id_to_syllable, ignore_ids=syllable_ignore_ids)
+                        ),
+                        "pred_tones": " ".join(_decode_token_labels(pred_tones, id_to_tone, ignore_ids=tone_ignore_ids)),
+                        "pred_syllable_tone": " ".join(
+                            decode_dual_stream_pairs(
+                                syllable_ids=pred_syllables,
+                                tone_ids=pred_tones,
+                                id_to_syllable=id_to_syllable,
+                                id_to_tone=id_to_tone,
+                                syllable_ignore_ids=syllable_ignore_ids,
+                                tone_ignore_ids=tone_ignore_ids,
+                            )
+                        ),
+                        "syllable_edits": syllable_edits,
+                        "syllable_total": syllable_total,
+                        "syllable_per": syllable_edits / max(1, syllable_total),
+                        "tone_edits": tone_edits,
+                        "tone_total": tone_total,
+                        "tone_per": tone_edits / max(1, tone_total),
+                        "syllable_tone_edits": paired_edits,
+                        "syllable_tone_total": paired_total,
+                        "syllable_tone_per": paired_edits / max(1, paired_total),
+                    }
+                )
+    return rows
+
+
+def _write_prediction_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    fieldnames = [
+        "split",
+        "session",
+        "block_num",
+        "trial_num",
+        "transcription",
+        "true_syllables",
+        "true_tones",
+        "true_syllable_tone",
+        "pred_syllables",
+        "pred_tones",
+        "pred_syllable_tone",
+        "syllable_edits",
+        "syllable_total",
+        "syllable_per",
+        "tone_edits",
+        "tone_total",
+        "tone_per",
+        "syllable_tone_edits",
+        "syllable_tone_total",
+        "syllable_tone_per",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, object]:
@@ -563,6 +801,9 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
     train_losses: List[float] = []
     val_metrics: List[Dict[str, float]] = []
     best_val_loss = math.inf
+    best_checkpoint_metric = str(cfg.training.get("checkpoint_metric", "syllable_tone_per"))
+    best_checkpoint_value = math.inf
+    best_checkpoint_batch = 0
     iterator = iter(train_loader)
 
     for step in range(1, int(cfg.training.num_batches) + 1):
@@ -617,7 +858,51 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
             _print_eval_metrics("val", metrics, batch=step)
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
+            if _is_better_checkpoint(metrics, best_value=best_checkpoint_value, metric=best_checkpoint_metric):
+                best_checkpoint_value = float(metrics[best_checkpoint_metric])
+                best_checkpoint_batch = step
+                if bool(cfg.get("save_checkpoint", True)):
+                    _save_checkpoint(
+                        checkpoint_dir / "best.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        label_maps=label_maps,
+                        metrics=metrics,
+                        batch=step,
+                        checkpoint_kind="best",
+                    )
 
+    final_metrics: Dict[str, object] = {}
+    if bool(cfg.get("save_checkpoint", True)):
+        _save_checkpoint(
+            checkpoint_dir / "latest.pt",
+            model=model,
+            optimizer=optimizer,
+            cfg=cfg,
+            label_maps=label_maps,
+            metrics=val_metrics[-1] if val_metrics else {},
+            batch=int(cfg.training.num_batches),
+            checkpoint_kind="latest",
+        )
+        best_path = checkpoint_dir / "best.pt"
+        if best_path.exists():
+            checkpoint = torch.load(best_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+
+    final_val_metrics = _evaluate(
+        model=model,
+        loader=val_loader,
+        device=device,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        tone_weight=tone_weight,
+        smooth_data=smooth_data,
+        smooth_kernel_std=smooth_kernel_std,
+        smooth_kernel_size=smooth_kernel_size,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
     test_metrics = _evaluate(
         model=model,
         loader=test_loader,
@@ -631,7 +916,44 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
         syllable_ignore_ids=syllable_ignore_ids,
         tone_ignore_ids=tone_ignore_ids,
     )
+    _print_eval_metrics("final_val", final_val_metrics)
     _print_eval_metrics("test", test_metrics)
+    prediction_rows = []
+    prediction_rows.extend(
+        _prediction_rows(
+            model=model,
+            loader=val_loader,
+            split="val",
+            device=device,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            smooth_data=smooth_data,
+            smooth_kernel_std=smooth_kernel_std,
+            smooth_kernel_size=smooth_kernel_size,
+            label_maps=label_maps,
+            syllable_ignore_ids=syllable_ignore_ids,
+            tone_ignore_ids=tone_ignore_ids,
+        )
+    )
+    prediction_rows.extend(
+        _prediction_rows(
+            model=model,
+            loader=test_loader,
+            split="test",
+            device=device,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            smooth_data=smooth_data,
+            smooth_kernel_std=smooth_kernel_std,
+            smooth_kernel_size=smooth_kernel_size,
+            label_maps=label_maps,
+            syllable_ignore_ids=syllable_ignore_ids,
+            tone_ignore_ids=tone_ignore_ids,
+        )
+    )
+    prediction_csv_path = output_dir / "val_test_predictions.csv"
+    _write_prediction_csv(prediction_csv_path, prediction_rows)
+    final_metrics["prediction_csv"] = str(prediction_csv_path)
 
     result: Dict[str, object] = {
         "device": str(device),
@@ -646,7 +968,12 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
         "train_losses": train_losses,
         "val_metrics": val_metrics,
         "best_val_loss": best_val_loss,
+        "best_checkpoint_metric": best_checkpoint_metric,
+        "best_checkpoint_value": best_checkpoint_value,
+        "best_checkpoint_batch": best_checkpoint_batch,
+        "final_val_metrics": final_val_metrics,
         "test_metrics": test_metrics,
+        **final_metrics,
     }
 
     (output_dir / "metrics.json").write_text(
@@ -654,19 +981,6 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
         encoding="utf-8",
     )
     OmegaConf.save(config=cfg, f=output_dir / "config.yaml")
-
-    if bool(cfg.get("save_checkpoint", True)):
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": OmegaConf.to_container(cfg, resolve=True),
-            "label_maps": {
-                "syllable_to_id": label_maps.syllable_to_id,
-                "tone_to_id": label_maps.tone_to_id,
-            },
-            "metrics": result,
-        }
-        torch.save(checkpoint, checkpoint_dir / "latest.pt")
 
     return result
 
@@ -710,7 +1024,7 @@ def evaluate_checkpoint_from_config(
         device=device,
     )
     if checkpoint_path is None:
-        checkpoint_path = _resolve_project_path(cfg.output_dir) / "checkpoints" / "latest.pt"
+        checkpoint_path = _default_checkpoint_path(_resolve_project_path(cfg.output_dir))
     else:
         checkpoint_path = _resolve_project_path(checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -767,6 +1081,42 @@ def evaluate_checkpoint_from_config(
 
     output_dir = _resolve_project_path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_rows = []
+    prediction_rows.extend(
+        _prediction_rows(
+            model=model,
+            loader=val_loader,
+            split="val",
+            device=device,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            smooth_data=smooth_data,
+            smooth_kernel_std=smooth_kernel_std,
+            smooth_kernel_size=smooth_kernel_size,
+            label_maps=label_maps,
+            syllable_ignore_ids=syllable_ignore_ids,
+            tone_ignore_ids=tone_ignore_ids,
+        )
+    )
+    prediction_rows.extend(
+        _prediction_rows(
+            model=model,
+            loader=test_loader,
+            split="test",
+            device=device,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            smooth_data=smooth_data,
+            smooth_kernel_std=smooth_kernel_std,
+            smooth_kernel_size=smooth_kernel_size,
+            label_maps=label_maps,
+            syllable_ignore_ids=syllable_ignore_ids,
+            tone_ignore_ids=tone_ignore_ids,
+        )
+    )
+    prediction_csv_path = output_dir / "eval_val_test_predictions.csv"
+    _write_prediction_csv(prediction_csv_path, prediction_rows)
+    result["prediction_csv"] = str(prediction_csv_path)
     (output_dir / "eval_metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2),
         encoding="utf-8",

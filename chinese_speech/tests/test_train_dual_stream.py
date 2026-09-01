@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -10,11 +11,15 @@ from omegaconf import OmegaConf
 
 from chinese_speech.dual_stream_dataset import ChineseDualStreamDataset
 from chinese_speech.train_dual_stream import (
+    _default_checkpoint_path,
+    _is_better_checkpoint,
     _paired_token_error_counts,
     _token_error_counts,
     adjusted_input_lengths,
     build_global_label_maps,
     decode_dual_stream_pairs,
+    discover_session_dirs,
+    evaluate_checkpoint_from_config,
     train_from_config,
 )
 
@@ -150,6 +155,48 @@ def test_paired_token_error_counts_combines_syllable_and_tone_ids():
     assert total == 2
 
 
+def test_checkpoint_selection_uses_syllable_tone_per_by_default():
+    assert _is_better_checkpoint(
+        {"loss": 9.0, "syllable_tone_per": 0.4},
+        best_value=0.5,
+        metric="syllable_tone_per",
+    )
+    assert not _is_better_checkpoint(
+        {"loss": 0.1, "syllable_tone_per": 0.6},
+        best_value=0.5,
+        metric="syllable_tone_per",
+    )
+
+
+def test_eval_only_prefers_best_checkpoint_when_available(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    latest = checkpoint_dir / "latest.pt"
+    best = checkpoint_dir / "best.pt"
+    latest.write_bytes(b"latest")
+    best.write_bytes(b"best")
+
+    assert _default_checkpoint_path(tmp_path) == best
+
+    best.unlink()
+    assert _default_checkpoint_path(tmp_path) == latest
+
+
+def test_discover_session_dirs_requires_train_val_and_test_hdf5(tmp_path):
+    session_dir = tmp_path / "session_a"
+    session_dir.mkdir()
+    _write_metadata(session_dir, {"<blank>": 0, "ma": 1, "<sil>": 2})
+    _write_split(session_dir / "data_train.hdf5", syllables=[2, 1, 2], tones=[3, 1, 3])
+    _write_split(session_dir / "data_val.hdf5", syllables=[2, 1, 2], tones=[3, 1, 3])
+
+    try:
+        discover_session_dirs(tmp_path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("session discovery accepted a session without data_test.hdf5")
+
+
 def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     data_root = tmp_path / "hdf5_chinese"
     _write_session(
@@ -219,5 +266,17 @@ def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     assert "syllable_per" in result["test_metrics"]
     assert "tone_per" in result["test_metrics"]
     assert "syllable_tone_per" in result["test_metrics"]
+    assert result["best_checkpoint_metric"] == "syllable_tone_per"
     assert (output_dir / "metrics.json").exists()
+    assert (output_dir / "val_test_predictions.csv").exists()
+    with open(output_dir / "val_test_predictions.csv", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["split"] for row in rows} == {"val", "test"}
+    assert "true_syllable_tone" in rows[0]
+    assert "pred_syllable_tone" in rows[0]
+    assert "syllable_tone_per" in rows[0]
+    assert (output_dir / "checkpoints" / "best.pt").exists()
     assert (output_dir / "checkpoints" / "latest.pt").exists()
+
+    eval_result = evaluate_checkpoint_from_config(config)
+    assert Path(eval_result["checkpoint_path"]).name == "best.pt"

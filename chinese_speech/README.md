@@ -7,6 +7,7 @@ This folder is a Mandarin-specific side path for the copied `Speech` repo. It do
 - The preprocessing builder reads session folders from `../sub-01/speech`, not `speech.zip`.
 - Uses `trial_data.mat` sorted-spike data and aggregates valid units to 256 physical electrodes.
 - Uses `state_bin == 2` as the read/intended-speech epoch.
+- Applies per-day z-score normalization from the first 20 included sentence trials for that day; the same fixed mean/std is used for that day's train, val, and test trials.
 - Builds Mandarin labels as two aligned CTC streams:
   - `seq_syllable_ids`: pinyin base syllables, no tone number.
   - `seq_tone_ids`: tone numbers `1..5`.
@@ -95,14 +96,19 @@ python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.
 During training, validation runs every `training.val_every` batches and prints:
 
 ```text
-batch=100 val_loss=... val_syllable_per=... val_tone_per=... val_syllable_tone_per=...
+batch=100 val_loss=... val_syllable_loss=... val_tone_loss=... val_syllable_per=... val_tone_per=... val_syllable_tone_per=...
 ```
 
-After training, the script evaluates `data_test.hdf5` once and prints:
+The best checkpoint is saved to `checkpoints/best.pt` using the lowest validation `syllable_tone_per`. The final training step is also saved as `checkpoints/latest.pt`.
+
+After training, the script reloads `best.pt`, evaluates val/test, prints:
 
 ```text
-test_loss=... test_syllable_per=... test_tone_per=... test_syllable_tone_per=...
+final_val_loss=... final_val_syllable_loss=... final_val_tone_loss=... final_val_syllable_per=... final_val_tone_per=... final_val_syllable_tone_per=...
+test_loss=... test_syllable_loss=... test_tone_loss=... test_syllable_per=... test_tone_per=... test_syllable_tone_per=...
 ```
+
+and writes `val_test_predictions.csv` with the true/predicted syllables, tones, paired syllable-tone tokens, and per-trial PER for each val/test trial.
 
 To evaluate an existing checkpoint without retraining:
 
@@ -110,7 +116,7 @@ To evaluate an existing checkpoint without retraining:
 python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.yaml --eval-only
 ```
 
-Use `--checkpoint path/to/latest.pt` if the checkpoint is not under the config's `output_dir/checkpoints/latest.pt`.
+By default this reads `checkpoints/best.pt`, falling back to `checkpoints/latest.pt` only when `best.pt` does not exist. Use `--checkpoint path/to/latest.pt` to force a specific checkpoint.
 
 PER is reported three ways:
 
