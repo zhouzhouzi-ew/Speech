@@ -95,13 +95,13 @@ python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.
 During training, validation runs every `training.val_every` batches and prints:
 
 ```text
-batch=100 val_loss=... val_syllable_per=... val_tone_per=...
+batch=100 val_loss=... val_syllable_per=... val_tone_per=... val_syllable_tone_per=...
 ```
 
 After training, the script evaluates `data_test.hdf5` once and prints:
 
 ```text
-test_loss=... test_syllable_per=... test_tone_per=...
+test_loss=... test_syllable_per=... test_tone_per=... test_syllable_tone_per=...
 ```
 
 To evaluate an existing checkpoint without retraining:
@@ -111,6 +111,16 @@ python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.
 ```
 
 Use `--checkpoint path/to/latest.pt` if the checkpoint is not under the config's `output_dir/checkpoints/latest.pt`.
+
+PER is reported three ways:
+
+```text
+syllable_per       edit distance over pinyin base syllables
+tone_per           edit distance over tone tokens
+syllable_tone_per  edit distance over paired tokens like wo3 / mei2
+```
+
+The PER calculation ignores CTC blank and the added `<sil>` boundaries. If the decoded syllable and tone streams have different lengths, missing parts are kept as `?`/`<missing_syllable>` so the mismatch is counted instead of silently truncated.
 
 The training script builds one global syllable/tone label map across all configured sessions and remaps each session's local HDF5 ids before computing CTC loss. This is required because the per-session HDF5 metadata can assign different local ids to the same syllable.
 

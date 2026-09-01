@@ -10,9 +10,11 @@ from omegaconf import OmegaConf
 
 from chinese_speech.dual_stream_dataset import ChineseDualStreamDataset
 from chinese_speech.train_dual_stream import (
+    _paired_token_error_counts,
     _token_error_counts,
     adjusted_input_lengths,
     build_global_label_maps,
+    decode_dual_stream_pairs,
     train_from_config,
 )
 
@@ -121,6 +123,33 @@ def test_token_error_counts_ignores_ctc_blank_and_silence_boundaries():
     assert total == 2
 
 
+def test_decode_dual_stream_pairs_aligns_streams_and_marks_missing_parts():
+    pairs = decode_dual_stream_pairs(
+        syllable_ids=[3, 1, 0, 2, 3],
+        tone_ids=[6, 2, 0, 6],
+        id_to_syllable={0: "<blank>", 1: "wo", 2: "mei", 3: "<sil>"},
+        id_to_tone={0: "<blank>", 2: "3", 6: "<sil>"},
+        syllable_ignore_ids={0, 3},
+        tone_ignore_ids={0, 6},
+    )
+
+    assert pairs == ["wo3", "mei?"]
+
+
+def test_paired_token_error_counts_combines_syllable_and_tone_ids():
+    edits, total = _paired_token_error_counts(
+        reference_syllables=[3, 1, 2, 3],
+        reference_tones=[6, 2, 3, 6],
+        hypothesis_syllables=[3, 1, 2, 3],
+        hypothesis_tones=[6, 2, 4, 6],
+        syllable_ignore_ids={0, 3},
+        tone_ignore_ids={0, 6},
+    )
+
+    assert edits == 1
+    assert total == 2
+
+
 def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     data_root = tmp_path / "hdf5_chinese"
     _write_session(
@@ -185,8 +214,10 @@ def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     assert np.isfinite(result["best_val_loss"])
     assert "syllable_per" in result["val_metrics"][-1]
     assert "tone_per" in result["val_metrics"][-1]
+    assert "syllable_tone_per" in result["val_metrics"][-1]
     assert "test_metrics" in result
     assert "syllable_per" in result["test_metrics"]
     assert "tone_per" in result["test_metrics"]
+    assert "syllable_tone_per" in result["test_metrics"]
     assert (output_dir / "metrics.json").exists()
     assert (output_dir / "checkpoints" / "latest.pt").exists()

@@ -23,6 +23,8 @@ from .losses import dual_stream_ctc_loss
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BLANK_TOKEN = "<blank>"
 SIL_TOKEN = "<sil>"
+MISSING_SYLLABLE_ID = -1
+MISSING_TONE_ID = -1
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,76 @@ def _token_error_counts(
     return _edit_distance(filtered_reference, filtered_hypothesis), len(filtered_reference)
 
 
+def _paired_token_ids(
+    syllable_ids: Sequence[int],
+    tone_ids: Sequence[int],
+    *,
+    syllable_ignore_ids: set[int],
+    tone_ignore_ids: set[int],
+) -> List[tuple[int, int]]:
+    syllables = [int(item) for item in syllable_ids if int(item) not in syllable_ignore_ids]
+    tones = [int(item) for item in tone_ids if int(item) not in tone_ignore_ids]
+    n_pairs = max(len(syllables), len(tones))
+    return [
+        (
+            syllables[idx] if idx < len(syllables) else MISSING_SYLLABLE_ID,
+            tones[idx] if idx < len(tones) else MISSING_TONE_ID,
+        )
+        for idx in range(n_pairs)
+    ]
+
+
+def _paired_token_error_counts(
+    *,
+    reference_syllables: Sequence[int],
+    reference_tones: Sequence[int],
+    hypothesis_syllables: Sequence[int],
+    hypothesis_tones: Sequence[int],
+    syllable_ignore_ids: set[int],
+    tone_ignore_ids: set[int],
+) -> tuple[int, int]:
+    reference = _paired_token_ids(
+        reference_syllables,
+        reference_tones,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+    hypothesis = _paired_token_ids(
+        hypothesis_syllables,
+        hypothesis_tones,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+    return _edit_distance(reference, hypothesis), len(reference)
+
+
+def decode_dual_stream_pairs(
+    *,
+    syllable_ids: Sequence[int],
+    tone_ids: Sequence[int],
+    id_to_syllable: Mapping[int, str],
+    id_to_tone: Mapping[int, str],
+    syllable_ignore_ids: set[int],
+    tone_ignore_ids: set[int],
+) -> List[str]:
+    pairs = _paired_token_ids(
+        syllable_ids,
+        tone_ids,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+    decoded: List[str] = []
+    for syllable_id, tone_id in pairs:
+        syllable = (
+            "<missing_syllable>"
+            if syllable_id == MISSING_SYLLABLE_ID
+            else str(id_to_syllable.get(int(syllable_id), f"<unk:{syllable_id}>"))
+        )
+        tone = "?" if tone_id == MISSING_TONE_ID else str(id_to_tone.get(int(tone_id), f"<unk:{tone_id}>"))
+        decoded.append(f"{syllable}{tone}")
+    return decoded
+
+
 def _ctc_greedy(logits: torch.Tensor, valid_len: int) -> List[int]:
     ids = torch.argmax(logits[:valid_len], dim=-1)
     ids = torch.unique_consecutive(ids, dim=-1)
@@ -236,6 +308,8 @@ def _evaluate(
     syllable_total = 0
     tone_edits = 0
     tone_total = 0
+    syllable_tone_edits = 0
+    syllable_tone_total = 0
     with torch.no_grad():
         for raw_batch in loader:
             batch = _move_batch_to_device(raw_batch, device)
@@ -281,19 +355,35 @@ def _evaluate(
                 tone_edits += edits
                 tone_total += total
 
+                edits, total = _paired_token_error_counts(
+                    reference_syllables=true_syllables,
+                    reference_tones=true_tones,
+                    hypothesis_syllables=pred_syllables,
+                    hypothesis_tones=pred_tones,
+                    syllable_ignore_ids=syllable_ignore_ids,
+                    tone_ignore_ids=tone_ignore_ids,
+                )
+                syllable_tone_edits += edits
+                syllable_tone_total += total
+
     syllable_per = syllable_edits / max(1, syllable_total)
     tone_per = tone_edits / max(1, tone_total)
+    syllable_tone_per = syllable_tone_edits / max(1, syllable_tone_total)
 
     return {
         "loss": float(np.mean(losses)) if losses else math.inf,
         "syllable_per": syllable_per,
         "tone_per": tone_per,
+        "syllable_tone_per": syllable_tone_per,
         "syllable_error_rate": syllable_per,
         "tone_error_rate": tone_per,
+        "syllable_tone_error_rate": syllable_tone_per,
         "syllable_edits": float(syllable_edits),
         "syllable_total": float(syllable_total),
         "tone_edits": float(tone_edits),
         "tone_total": float(tone_total),
+        "syllable_tone_edits": float(syllable_tone_edits),
+        "syllable_tone_total": float(syllable_tone_total),
     }
 
 
@@ -401,7 +491,8 @@ def _print_eval_metrics(prefix: str, metrics: Mapping[str, float], *, batch: int
     print(
         f"{batch_part}{prefix}_loss={metrics['loss']:.4f} "
         f"{prefix}_syllable_per={metrics['syllable_per']:.4f} "
-        f"{prefix}_tone_per={metrics['tone_per']:.4f}"
+        f"{prefix}_tone_per={metrics['tone_per']:.4f} "
+        f"{prefix}_syllable_tone_per={metrics['syllable_tone_per']:.4f}"
     )
 
 
