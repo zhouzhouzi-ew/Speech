@@ -298,7 +298,7 @@ def _parse_args():
     default_output_prefix = "baseline_rnn"
     parser = argparse.ArgumentParser(description="Evaluate a pretrained RNN model on the copy task dataset.")
     parser.add_argument("--model_path", type=str, default="../data/t15_pretrained_rnn_baseline")
-    parser.add_argument("--data_dir", type=str, default="../data/hdf5_data_final")
+    parser.add_argument("--data_dir", type=str, default="../data/hdf5_data_512")
     parser.add_argument("--eval_type", type=str, default="test", choices=["val", "test","train"])
     parser.add_argument("--csv_path", type=str, default="../data/t15_copyTaskData_description.csv")
     parser.add_argument("--gpu_number", type=int, default=1)

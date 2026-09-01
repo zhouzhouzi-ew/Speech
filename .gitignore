@@ -5,6 +5,7 @@ __pycache__/
 
 # Models / checkpoints
 model_training/trained_models/
+chinese_speech/trained_models/
 
 # Runtime build artifacts
 language_model/runtime/server/x86/build/
@@ -14,6 +15,7 @@ language_model/runtime/server/x86/fc_base/
 # Large generated HDF5 data
 *.hdf5
 *.h5
+chinese_speech/hdf5_data_syllable_tone/
 
 # Generated LM build outputs
 language_model/examples/speech/s0/t15_2026_08_01_3gram/

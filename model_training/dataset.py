@@ -7,6 +7,16 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 import math
 
+
+def _hdf5_scalar(value):
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return arr.item()
+    if arr.size == 1:
+        return arr.reshape(-1)[0].item()
+    return value
+
+
 class BrainToTextDataset(Dataset):
     '''
     Dataset for brain-to-text data
@@ -23,7 +33,8 @@ class BrainToTextDataset(Dataset):
             days_per_batch = 1, 
             random_seed = -1,
             must_include_days = None,
-            feature_subset = None
+            feature_subset = None,
+            expected_feature_dim = None,
             ): 
         '''
         trial_indicies:  (dict)      - dictionary with day numbers as keys and lists of trial indices as values
@@ -34,7 +45,8 @@ class BrainToTextDataset(Dataset):
                                        to individual day layers in the GRU are not excesively noisy. Validation data will always have 1 day per batch
         random_seed:     (int)       - seed to set for randomly assigning trials to a batch. If set to -1, trial assignment will be random
         must_include_days ([int])    - list of days that must be included in every batch
-        feature_subset  ([int])      - list of neural feature indicies that should be the only features included in the neural data 
+        feature_subset  ([int])      - list of neural feature indicies that should be the only features included in the neural data
+        expected_feature_dim (int)   - expected neural feature count after any feature_subset is applied
          '''
         
         # Set random seed for reproducibility
@@ -60,6 +72,7 @@ class BrainToTextDataset(Dataset):
         self.n_days = len(trial_indicies.keys())
 
         self.feature_subset = feature_subset
+        self.expected_feature_dim = expected_feature_dim
 
         # Calculate total number of trials in the dataset
         for d in trial_indicies:
@@ -124,27 +137,35 @@ class BrainToTextDataset(Dataset):
                 # For each trial in the selected trials in that day
                 for t in index[d]:
                     
-                    try: 
-                        g = f[f'trial_{t:04d}']
+                    g = f[f'trial_{t:04d}']
 
-                        # Remove features is neccessary 
-                        input_features = torch.from_numpy(g['input_features'][:]) # neural data
-                        if self.feature_subset:
-                            input_features = input_features[:,self.feature_subset]
+                    input_features = torch.from_numpy(g['input_features'][:]).float() # neural data
+                    if self.feature_subset is not None:
+                        input_features = input_features[:,self.feature_subset]
 
-                        batch['input_features'].append(input_features)
+                    if (
+                        self.expected_feature_dim is not None
+                        and input_features.shape[-1] != self.expected_feature_dim
+                    ):
+                        raise ValueError(
+                            f'Loaded input_features with dim {input_features.shape[-1]} from '
+                            f'{self.trial_indicies[d]["session_path"]} trial_{t:04d}; '
+                            f'expected {self.expected_feature_dim}. Check dataset_dir and feature_subset. '
+                            '512D TC/SBP data must remain ordered as [TC Elec1..256 | SBP Elec1..256].'
+                        )
 
-                        batch['seq_class_ids'].append(torch.from_numpy(g['seq_class_ids'][:]))  # phoneme labels
-                        batch['transcriptions'].append(torch.from_numpy(g['transcription'][:])) # character level transcriptions
-                        batch['n_time_steps'].append(g.attrs['n_time_steps']) # number of time steps in the trial - required since we are padding
-                        batch['phone_seq_lens'].append(g.attrs['seq_len']) # number of phonemes in the label - required since we are padding
-                        batch['day_indicies'].append(int(d)) # day index of each trial - required for the day specific layers 
-                        batch['block_nums'].append(g.attrs['block_num'])
-                        batch['trial_nums'].append(g.attrs['trial_num'])
-                    
-                    except Exception as e:
-                        print(f'Error loading trial {t} from session {self.trial_indicies[d]["session_path"]}: {e}')
-                        continue
+                    seq_class_ids = torch.from_numpy(g['seq_class_ids'][:])
+                    seq_len = _hdf5_scalar(g.attrs['seq_len']) if 'seq_len' in g.attrs else len(seq_class_ids)
+
+                    batch['input_features'].append(input_features)
+
+                    batch['seq_class_ids'].append(seq_class_ids)  # phoneme labels
+                    batch['transcriptions'].append(torch.from_numpy(g['transcription'][:])) # character level transcriptions
+                    batch['n_time_steps'].append(_hdf5_scalar(g.attrs['n_time_steps'])) # number of time steps in the trial - required since we are padding
+                    batch['phone_seq_lens'].append(seq_len) # number of phonemes in the label - required since we are padding
+                    batch['day_indicies'].append(int(d)) # day index of each trial - required for the day specific layers
+                    batch['block_nums'].append(_hdf5_scalar(g.attrs['block_num']))
+                    batch['trial_nums'].append(_hdf5_scalar(g.attrs['trial_num']))
 
         # Pad data to form a cohesive batch
         batch['input_features'] = pad_sequence(batch['input_features'], batch_first = True, padding_value = 0)

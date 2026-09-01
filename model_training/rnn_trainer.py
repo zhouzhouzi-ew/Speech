@@ -151,6 +151,14 @@ class BrainToTextDecoder_Trainer:
         
         self.logger.info(f"Model has {day_params:,} day-specific parameters | {((day_params / total_params) * 100):.2f}% of total parameters")
 
+        expected_feature_dim = int(self.args['model']['n_input_features'])
+        dataset_neural_dim = self.args['dataset'].get('neural_dim', expected_feature_dim)
+        if int(dataset_neural_dim) != expected_feature_dim:
+            raise ValueError(
+                f"dataset.neural_dim ({dataset_neural_dim}) must match "
+                f"model.n_input_features ({expected_feature_dim})"
+            )
+
         # Create datasets and dataloaders
         train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
         val_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_val.hdf5') for s in self.args['dataset']['sessions']]
@@ -194,7 +202,8 @@ class BrainToTextDecoder_Trainer:
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
             random_seed = self.args['dataset']['seed'],
-            feature_subset = feature_subset
+            feature_subset = feature_subset,
+            expected_feature_dim = expected_feature_dim,
             )
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -213,7 +222,8 @@ class BrainToTextDecoder_Trainer:
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
             random_seed = self.args['dataset']['seed'],
-            feature_subset = feature_subset   
+            feature_subset = feature_subset,
+            expected_feature_dim = expected_feature_dim,
             )
         self.val_loader = DataLoader(
             self.val_dataset,

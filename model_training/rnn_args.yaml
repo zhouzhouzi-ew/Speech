@@ -1,5 +1,5 @@
 model:
-  n_input_features: 256 # number of input features in the neural data. (1 feature per electrode (TC only), 256 electrodes)
+  n_input_features: 512 # number of input features in the neural data: [TC Elec1..256 | SBP Elec1..256]
   n_units: 768 # number of units per GRU layer
   rnn_dropout: 0.4 # dropout rate for the GRU layers
   rnn_trainable: true # whether the GRU layers are trainable
@@ -10,7 +10,7 @@ model:
   input_network:
     n_input_layers: 1 # number of input layers per network (one network for each day)
     input_layer_sizes:
-    - 256 # size of the input layer (number of input features)
+    - 512 # size of the input layer (number of input features)
     input_trainable: true # whether the input layer is trainable
     input_layer_dropout: 0.2 # dropout rate for the input layer
 
@@ -18,8 +18,8 @@ gpu_number: '1' # GPU number to use for training, formatted as a string (e.g., '
 mode: train
 use_amp: true # whether to use automatic mixed precision (AMP) for training
 
-output_dir: trained_models/baseline_rnn # directory to save the trained model and logs
-checkpoint_dir: trained_models/baseline_rnn/checkpoint # directory to save checkpoints during training
+output_dir: trained_models/baseline_rnn_512 # directory to save the trained model and logs
+checkpoint_dir: trained_models/baseline_rnn_512/checkpoint # directory to save checkpoints during training
 init_from_checkpoint: false # whether to initialize the model from a checkpoint
 init_checkpoint_path: None # path to the checkpoint to initialize the model from, if any
 save_best_checkpoint: true # whether to save the best checkpoint based on validation metrics
@@ -69,7 +69,7 @@ dataset:
     smooth_data: true # whether to smooth the data
     smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
 
-  neural_dim: 256 # dimensionality of the neural data
+  neural_dim: 512 # dimensionality of the neural data
   batch_size: 64 # batch size for training
   n_classes: 35 # number of classes in the dataset (CTC blank + 33 phonemes + SIL)
   max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
@@ -79,11 +79,11 @@ dataset:
   loader_shuffle: false # whether to shuffle the data loader
   must_include_days: null # specific days to include in the dataset
   test_percentage: 0.1 # percentage of data to use for testing
-  feature_subset: null # specific features to include in the dataset
+  feature_subset: null # keep null for full 512D TC/SBP input; non-null subsets intentionally drop features
 
-  dataset_dir: ../data/hdf5_data_final # directory containing the dataset
+  dataset_dir: ../data/hdf5_data_512 # directory containing the dataset
   bad_trials_dict: null # dictionary of bad trials to exclude from the dataset
   sessions: # list of sessions to include in the dataset
-  - t15.2026.08.01
+  - t15.2026.08.14.10-11-24_tc_sbp_512
   dataset_probability_val: # probability of including a trial in the validation set (0 or 1)
   - 1

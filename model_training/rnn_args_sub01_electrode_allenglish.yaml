@@ -1,5 +1,5 @@
 model:
-  n_input_features: 256
+  n_input_features: 512
   n_units: 768
   rnn_dropout: 0.4
   rnn_trainable: true
@@ -10,7 +10,7 @@ model:
   input_network:
     n_input_layers: 1
     input_layer_sizes:
-    - 256
+    - 512
     input_trainable: true
     input_layer_dropout: 0.2
 
@@ -18,8 +18,8 @@ gpu_number: '1'
 mode: train
 use_amp: true
 
-output_dir: trained_models/sub01_electrode_allenglish
-checkpoint_dir: trained_models/sub01_electrode_allenglish/checkpoint
+output_dir: trained_models/sub01_electrode_allenglish_512
+checkpoint_dir: trained_models/sub01_electrode_allenglish_512/checkpoint
 init_from_checkpoint: false
 init_checkpoint_path: None
 save_best_checkpoint: true
@@ -69,7 +69,7 @@ dataset:
     smooth_data: true
     smooth_kernel_std: 2
 
-  neural_dim: 256
+  neural_dim: 512
   batch_size: 64
   n_classes: 35
   max_seq_elements: 500
@@ -81,17 +81,9 @@ dataset:
   test_percentage: 0.1
   feature_subset: null
 
-  dataset_dir: ../data/hdf5_data_final
+  dataset_dir: ../data/hdf5_data_512
   bad_trials_dict: null
   sessions:
-  - t15.2026.08.01.15-37-17_electrode
-  - t15.2026.08.13.17-36-11_electrode
-  - t15.2026.08.14.10-11-24_electrode
-  - t15.2026.08.14.15-05-37_electrode
-  - t15.2026.08.17.10-28-44_electrode
+  - t15.2026.08.14.10-11-24_tc_sbp_512
   dataset_probability_val:
-  - 1
-  - 1
-  - 1
-  - 1
   - 1

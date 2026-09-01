@@ -1,0 +1,31 @@
+seed: 1
+device: auto
+output_dir: chinese_speech/trained_models/dual_stream_syllable_tone
+save_checkpoint: true
+
+data:
+  hdf5_root: data/hdf5_chinese
+  sessions: all
+  batch_size: 32
+  num_workers: 0
+  expected_feature_dim: 256
+
+model:
+  n_units: 768
+  n_layers: 5
+  rnn_dropout: 0.4
+  input_dropout: 0.2
+  patch_size: 14
+  patch_stride: 4
+
+training:
+  num_batches: 2000
+  learning_rate: 0.001
+  weight_decay: 0.001
+  tone_weight: 1.0
+  grad_norm_clip: 10.0
+  smooth_data: true
+  smooth_kernel_std: 2.0
+  smooth_kernel_size: 100
+  log_every: 20
+  val_every: 100

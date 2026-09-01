@@ -12,7 +12,7 @@ All model training and evaluation code was tested on a computer running Ubuntu 2
 
 ## Training
 ### Baseline RNN Model
-We have included a custom PyTorch implementation of the RNN model used in the paper (the paper used a TensorFlow implementation). This implementation aims to replicate or improve upon the original model's performance while leveraging PyTorch's features, resulting in a more efficient training process with a slight increase in decoding accuracy. This model includes day-specific input layers (512x512 linear input layers with softsign activation), a 5-layer GRU with 768 hidden units per layer, and a linear output layer. The model is trained to predict phonemes from neural data using CTC loss and the AdamW optimizer. Data is augmented with noise and temporal jitter to improve robustness. All model hyperparameters are specified in the [`rnn_args.yaml`](rnn_args.yaml) file.
+We have included a custom PyTorch implementation of the RNN model used in the paper (the paper used a TensorFlow implementation). This implementation aims to replicate or improve upon the original model's performance while leveraging PyTorch's features, resulting in a more efficient training process with a slight increase in decoding accuracy. This model uses 512 neural input features ordered as `[TC Elec1..256 | SBP Elec1..256]`, day-specific 512x512 input layers with softsign activation, a 5-layer GRU with 768 hidden units per layer, and a linear output layer. The model is trained to predict phonemes from neural data using CTC loss and the AdamW optimizer. Data is augmented with noise and temporal jitter to improve robustness; causal z-score normalization is expected to already be present in the HDF5 files, while Gaussian smoothing remains part of training/evaluation. For future 512D HDF5 generation, rolling z-score statistics should use only the previous non-test trials, with train and val trials both allowed in the history and test trials excluded from later history. All model hyperparameters are specified in the [`rnn_args.yaml`](rnn_args.yaml) file.
 
 ### Model training script
 To train the baseline RNN model, use the `b2txt25` conda environment to run the `train_model.py` script from the `model_training` directory:
@@ -42,7 +42,7 @@ If the language model successfully starts and connects to Redis, you should see 
 Finally, use the `b2txt25` conda environment to run the `evaluate_model.py` script to load the pretrained baseline RNN, use it for inference on the heldout val or test sets to get phoneme logits, pass them through the language model via redis to get word predictions, and then save the predicted sentences to a .csv file in the format required for competition submission. An example output file for the val split can be found at `rnn_baseline_submission_file_valsplit.csv`.
 ```bash
 conda activate b2txt25
-python evaluate_model.py --model_path ../data/t15_pretrained_rnn_baseline --data_dir ../data/hdf5_data_final --eval_type test --gpu_number 1
+python evaluate_model.py --model_path ../data/t15_pretrained_rnn_baseline --data_dir ../data/hdf5_data_512 --eval_type test --gpu_number 1
 ```
 If the script runs successfully, it will save the predicted sentences to a text file named `baseline_rnn_{eval_type}_predicted_sentences_YYYYMMDD_HHMMSS.csv` in the pretrained model's directory (`/data/t15_pretrained_rnn_baseline`). The `eval_type` can be set to either `val` or `test`, depending on which dataset you want to evaluate.
 
