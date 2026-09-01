@@ -10,6 +10,7 @@ from omegaconf import OmegaConf
 
 from chinese_speech.dual_stream_dataset import ChineseDualStreamDataset
 from chinese_speech.train_dual_stream import (
+    _token_error_counts,
     adjusted_input_lengths,
     build_global_label_maps,
     train_from_config,
@@ -109,6 +110,17 @@ def test_adjusted_input_lengths_handles_patched_and_unpatched_inputs():
     assert adjusted_input_lengths(lengths, patch_size=14, patch_stride=4).tolist() == [2, 2]
 
 
+def test_token_error_counts_ignores_ctc_blank_and_silence_boundaries():
+    edits, total = _token_error_counts(
+        reference=[3, 1, 2, 3],
+        hypothesis=[3, 0, 1, 3],
+        ignore_ids={0, 3},
+    )
+
+    assert edits == 1
+    assert total == 2
+
+
 def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     data_root = tmp_path / "hdf5_chinese"
     _write_session(
@@ -171,5 +183,10 @@ def test_train_from_config_runs_independent_tiny_dual_stream_training(tmp_path):
     assert len(result["train_losses"]) == 2
     assert all(np.isfinite(result["train_losses"]))
     assert np.isfinite(result["best_val_loss"])
+    assert "syllable_per" in result["val_metrics"][-1]
+    assert "tone_per" in result["val_metrics"][-1]
+    assert "test_metrics" in result
+    assert "syllable_per" in result["test_metrics"]
+    assert "tone_per" in result["test_metrics"]
     assert (output_dir / "metrics.json").exists()
     assert (output_dir / "checkpoints" / "latest.pt").exists()

@@ -199,6 +199,17 @@ def _edit_distance(reference: Sequence[int], hypothesis: Sequence[int]) -> int:
     return previous[-1]
 
 
+def _token_error_counts(
+    reference: Sequence[int],
+    hypothesis: Sequence[int],
+    *,
+    ignore_ids: set[int],
+) -> tuple[int, int]:
+    filtered_reference = [int(item) for item in reference if int(item) not in ignore_ids]
+    filtered_hypothesis = [int(item) for item in hypothesis if int(item) not in ignore_ids]
+    return _edit_distance(filtered_reference, filtered_hypothesis), len(filtered_reference)
+
+
 def _ctc_greedy(logits: torch.Tensor, valid_len: int) -> List[int]:
     ids = torch.argmax(logits[:valid_len], dim=-1)
     ids = torch.unique_consecutive(ids, dim=-1)
@@ -216,6 +227,8 @@ def _evaluate(
     smooth_data: bool,
     smooth_kernel_std: float,
     smooth_kernel_size: int,
+    syllable_ignore_ids: set[int],
+    tone_ignore_ids: set[int],
 ) -> Dict[str, float]:
     model.eval()
     losses: List[float] = []
@@ -248,20 +261,39 @@ def _evaluate(
                 true_syllables = batch["seq_syllable_ids"][row_idx][
                     : batch["syllable_seq_lens"][row_idx]
                 ].detach().cpu().tolist()
-                syllable_edits += _edit_distance(true_syllables, pred_syllables)
-                syllable_total += len(true_syllables)
+                edits, total = _token_error_counts(
+                    true_syllables,
+                    pred_syllables,
+                    ignore_ids=syllable_ignore_ids,
+                )
+                syllable_edits += edits
+                syllable_total += total
 
                 pred_tones = _ctc_greedy(output["tone_logits"][row_idx], int(valid_len))
                 true_tones = batch["seq_tone_ids"][row_idx][
                     : batch["tone_seq_lens"][row_idx]
                 ].detach().cpu().tolist()
-                tone_edits += _edit_distance(true_tones, pred_tones)
-                tone_total += len(true_tones)
+                edits, total = _token_error_counts(
+                    true_tones,
+                    pred_tones,
+                    ignore_ids=tone_ignore_ids,
+                )
+                tone_edits += edits
+                tone_total += total
+
+    syllable_per = syllable_edits / max(1, syllable_total)
+    tone_per = tone_edits / max(1, tone_total)
 
     return {
         "loss": float(np.mean(losses)) if losses else math.inf,
-        "syllable_error_rate": syllable_edits / max(1, syllable_total),
-        "tone_error_rate": tone_edits / max(1, tone_total),
+        "syllable_per": syllable_per,
+        "tone_per": tone_per,
+        "syllable_error_rate": syllable_per,
+        "tone_error_rate": tone_per,
+        "syllable_edits": float(syllable_edits),
+        "syllable_total": float(syllable_total),
+        "tone_edits": float(tone_edits),
+        "tone_total": float(tone_total),
     }
 
 
@@ -272,9 +304,10 @@ def _make_loaders(
     batch_size: int,
     num_workers: int,
     expected_feature_dim: int,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     train_paths = [path / "data_train.hdf5" for path in session_dirs]
     val_paths = [path / "data_val.hdf5" for path in session_dirs]
+    test_paths = [path / "data_test.hdf5" for path in session_dirs]
     train_dataset = ChineseDualStreamDataset(
         train_paths,
         split="train",
@@ -284,6 +317,12 @@ def _make_loaders(
     val_dataset = ChineseDualStreamDataset(
         val_paths,
         split="val",
+        label_remaps=label_maps.remaps,
+        expected_feature_dim=expected_feature_dim,
+    )
+    test_dataset = ChineseDualStreamDataset(
+        test_paths,
+        split="test",
         label_remaps=label_maps.remaps,
         expected_feature_dim=expected_feature_dim,
     )
@@ -301,7 +340,14 @@ def _make_loaders(
         num_workers=0,
         collate_fn=collate_dual_stream,
     )
-    return train_loader, val_loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_dual_stream,
+    )
+    return train_loader, val_loader, test_loader
 
 
 def _next_batch(loader: DataLoader, iterator: object) -> tuple[object, object]:
@@ -319,6 +365,44 @@ def _device_from_config(config: DictConfig) -> torch.device:
     if requested.startswith("cuda") and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(requested)
+
+
+def _make_model(
+    *,
+    cfg: DictConfig,
+    expected_feature_dim: int,
+    n_days: int,
+    label_maps: LabelMaps,
+    device: torch.device,
+) -> DualStreamGRUDecoder:
+    return DualStreamGRUDecoder(
+        neural_dim=expected_feature_dim,
+        n_units=int(cfg.model.n_units),
+        n_days=n_days,
+        n_syllable_classes=len(label_maps.syllable_to_id),
+        n_tone_classes=len(label_maps.tone_to_id),
+        rnn_dropout=float(cfg.model.get("rnn_dropout", 0.0)),
+        input_dropout=float(cfg.model.get("input_dropout", 0.0)),
+        n_layers=int(cfg.model.n_layers),
+        patch_size=int(cfg.model.get("patch_size", 0)),
+        patch_stride=int(cfg.model.get("patch_stride", 0)),
+    ).to(device)
+
+
+def _ignore_ids(label_map: Mapping[str, int]) -> set[int]:
+    ids = {int(label_map[BLANK_TOKEN])}
+    if SIL_TOKEN in label_map:
+        ids.add(int(label_map[SIL_TOKEN]))
+    return ids
+
+
+def _print_eval_metrics(prefix: str, metrics: Mapping[str, float], *, batch: int | None = None) -> None:
+    batch_part = "" if batch is None else f"batch={batch} "
+    print(
+        f"{batch_part}{prefix}_loss={metrics['loss']:.4f} "
+        f"{prefix}_syllable_per={metrics['syllable_per']:.4f} "
+        f"{prefix}_tone_per={metrics['tone_per']:.4f}"
+    )
 
 
 def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, object]:
@@ -350,7 +434,7 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
     if bool(cfg.get("save_checkpoint", True)):
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader = _make_loaders(
+    train_loader, val_loader, test_loader = _make_loaders(
         session_dirs=session_dirs,
         label_maps=label_maps,
         batch_size=int(cfg.data.batch_size),
@@ -359,18 +443,13 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
     )
 
     device = _device_from_config(cfg)
-    model = DualStreamGRUDecoder(
-        neural_dim=expected_feature_dim,
-        n_units=int(cfg.model.n_units),
+    model = _make_model(
+        cfg=cfg,
+        expected_feature_dim=expected_feature_dim,
         n_days=len(session_dirs),
-        n_syllable_classes=len(label_maps.syllable_to_id),
-        n_tone_classes=len(label_maps.tone_to_id),
-        rnn_dropout=float(cfg.model.get("rnn_dropout", 0.0)),
-        input_dropout=float(cfg.model.get("input_dropout", 0.0)),
-        n_layers=int(cfg.model.n_layers),
-        patch_size=int(cfg.model.get("patch_size", 0)),
-        patch_stride=int(cfg.model.get("patch_stride", 0)),
-    ).to(device)
+        label_maps=label_maps,
+        device=device,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -387,6 +466,8 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
     grad_norm_clip = float(cfg.training.get("grad_norm_clip", 10.0))
     val_every = max(1, int(cfg.training.get("val_every", 100)))
     log_every = max(1, int(cfg.training.get("log_every", 20)))
+    syllable_ignore_ids = _ignore_ids(label_maps.syllable_to_id)
+    tone_ignore_ids = _ignore_ids(label_maps.tone_to_id)
 
     train_losses: List[float] = []
     val_metrics: List[Dict[str, float]] = []
@@ -437,11 +518,29 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
                 smooth_data=smooth_data,
                 smooth_kernel_std=smooth_kernel_std,
                 smooth_kernel_size=smooth_kernel_size,
+                syllable_ignore_ids=syllable_ignore_ids,
+                tone_ignore_ids=tone_ignore_ids,
             )
             metrics["batch"] = step
             val_metrics.append(metrics)
+            _print_eval_metrics("val", metrics, batch=step)
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
+
+    test_metrics = _evaluate(
+        model=model,
+        loader=test_loader,
+        device=device,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        tone_weight=tone_weight,
+        smooth_data=smooth_data,
+        smooth_kernel_std=smooth_kernel_std,
+        smooth_kernel_size=smooth_kernel_size,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+    _print_eval_metrics("test", test_metrics)
 
     result: Dict[str, object] = {
         "device": str(device),
@@ -456,6 +555,7 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
         "train_losses": train_losses,
         "val_metrics": val_metrics,
         "best_val_loss": best_val_loss,
+        "test_metrics": test_metrics,
     }
 
     (output_dir / "metrics.json").write_text(
@@ -480,6 +580,111 @@ def train_from_config(config: DictConfig | Mapping[str, object]) -> Dict[str, ob
     return result
 
 
+def evaluate_checkpoint_from_config(
+    config: DictConfig | Mapping[str, object],
+    *,
+    checkpoint_path: str | Path | None = None,
+) -> Dict[str, object]:
+    cfg = OmegaConf.create(config)
+    hdf5_root = _resolve_project_path(cfg.data.hdf5_root)
+    session_dirs = discover_session_dirs(hdf5_root, cfg.data.get("sessions", "all"))
+    label_maps = build_global_label_maps(session_dirs)
+
+    first_train_file = session_dirs[0] / "data_train.hdf5"
+    inferred_feature_dim = infer_feature_dim(first_train_file)
+    expected_feature_dim = cfg.data.get("expected_feature_dim", None)
+    if expected_feature_dim is None or str(expected_feature_dim).lower() == "auto":
+        expected_feature_dim = inferred_feature_dim
+    expected_feature_dim = int(expected_feature_dim)
+    if inferred_feature_dim != expected_feature_dim:
+        raise ValueError(
+            f"First Chinese HDF5 has feature dim {inferred_feature_dim}, "
+            f"but config expected {expected_feature_dim}"
+        )
+
+    _, val_loader, test_loader = _make_loaders(
+        session_dirs=session_dirs,
+        label_maps=label_maps,
+        batch_size=int(cfg.data.batch_size),
+        num_workers=int(cfg.data.get("num_workers", 0)),
+        expected_feature_dim=expected_feature_dim,
+    )
+
+    device = _device_from_config(cfg)
+    model = _make_model(
+        cfg=cfg,
+        expected_feature_dim=expected_feature_dim,
+        n_days=len(session_dirs),
+        label_maps=label_maps,
+        device=device,
+    )
+    if checkpoint_path is None:
+        checkpoint_path = _resolve_project_path(cfg.output_dir) / "checkpoints" / "latest.pt"
+    else:
+        checkpoint_path = _resolve_project_path(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    patch_size = int(cfg.model.get("patch_size", 0))
+    patch_stride = int(cfg.model.get("patch_stride", 0))
+    tone_weight = float(cfg.training.get("tone_weight", 1.0))
+    smooth_data = bool(cfg.training.get("smooth_data", True))
+    smooth_kernel_std = float(cfg.training.get("smooth_kernel_std", 2.0))
+    smooth_kernel_size = int(cfg.training.get("smooth_kernel_size", 100))
+    syllable_ignore_ids = _ignore_ids(label_maps.syllable_to_id)
+    tone_ignore_ids = _ignore_ids(label_maps.tone_to_id)
+
+    val_metrics = _evaluate(
+        model=model,
+        loader=val_loader,
+        device=device,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        tone_weight=tone_weight,
+        smooth_data=smooth_data,
+        smooth_kernel_std=smooth_kernel_std,
+        smooth_kernel_size=smooth_kernel_size,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+    test_metrics = _evaluate(
+        model=model,
+        loader=test_loader,
+        device=device,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        tone_weight=tone_weight,
+        smooth_data=smooth_data,
+        smooth_kernel_std=smooth_kernel_std,
+        smooth_kernel_size=smooth_kernel_size,
+        syllable_ignore_ids=syllable_ignore_ids,
+        tone_ignore_ids=tone_ignore_ids,
+    )
+
+    result: Dict[str, object] = {
+        "device": str(device),
+        "checkpoint_path": str(checkpoint_path),
+        "hdf5_root": str(hdf5_root),
+        "sessions": [path.name for path in session_dirs],
+        "n_days": len(session_dirs),
+        "feature_dim": expected_feature_dim,
+        "n_syllable_classes": len(label_maps.syllable_to_id),
+        "n_tone_classes": len(label_maps.tone_to_id),
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+    }
+
+    output_dir = _resolve_project_path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "eval_metrics.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _print_eval_metrics("val", val_metrics)
+    _print_eval_metrics("test", test_metrics)
+    return result
+
+
 def load_config(path: str | Path) -> DictConfig:
     return OmegaConf.load(path)
 
@@ -490,6 +695,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-batches", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--checkpoint", type=str, default=None)
     return parser.parse_args()
 
 
@@ -502,7 +709,10 @@ def main() -> None:
         config.output_dir = args.output_dir
     if args.device is not None:
         config.device = args.device
-    train_from_config(config)
+    if args.eval_only:
+        evaluate_checkpoint_from_config(config, checkpoint_path=args.checkpoint)
+    else:
+        train_from_config(config)
 
 
 if __name__ == "__main__":

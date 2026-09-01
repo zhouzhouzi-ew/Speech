@@ -12,6 +12,7 @@ This folder is a Mandarin-specific side path for the copied `Speech` repo. It do
   - `seq_tone_ids`: tone numbers `1..5`.
 - Keeps `seq_class_ids` as an alias of `seq_syllable_ids` so older single-head utilities can still inspect the file.
 - Skips blank/no-action trials by default and records them in `trial_manifest.csv`.
+- Excludes single-character diagnostic speech trials by default. Diagnostic-only sessions are skipped; mixed sessions record skipped trials as `excluded_diagnostic` in `trial_manifest.csv`.
 - The training script reads finished HDF5 files from `data/hdf5_chinese` and does not require raw `sub-01/speech` on the GPU machine.
 
 ## Build
@@ -35,6 +36,7 @@ python -m chinese_speech.builder --overwrite
 ```
 
 The default `--output-root` is `data/hdf5_chinese`.
+Use `--include-diagnostic-trials` only for explicit diagnostic-block experiments; the default training HDF5 is sentence-only.
 
 Final handoff output for training:
 
@@ -89,6 +91,26 @@ For a short smoke run:
 ```bash
 python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.yaml --num-batches 1 --output-dir chinese_speech/trained_models/smoke
 ```
+
+During training, validation runs every `training.val_every` batches and prints:
+
+```text
+batch=100 val_loss=... val_syllable_per=... val_tone_per=...
+```
+
+After training, the script evaluates `data_test.hdf5` once and prints:
+
+```text
+test_loss=... test_syllable_per=... test_tone_per=...
+```
+
+To evaluate an existing checkpoint without retraining:
+
+```bash
+python -m chinese_speech.train_dual_stream --config chinese_speech/train_config.yaml --eval-only
+```
+
+Use `--checkpoint path/to/latest.pt` if the checkpoint is not under the config's `output_dir/checkpoints/latest.pt`.
 
 The training script builds one global syllable/tone label map across all configured sessions and remaps each session's local HDF5 ids before computing CTC loss. This is required because the per-session HDF5 metadata can assign different local ids to the same syllable.
 

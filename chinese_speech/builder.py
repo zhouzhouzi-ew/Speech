@@ -194,6 +194,23 @@ def _pronunciation_string(pronunciation: Pronunciation) -> str:
     return " ".join(f"{syllable}{tone}" for syllable, tone in pronunciation)
 
 
+def _is_diagnostic_trial(trial: TaskTrial) -> bool:
+    return trial.condition == "speech" and len(trial.text) <= 1
+
+
+def _is_included_trial(
+    trial: TaskTrial,
+    *,
+    include_blank_trials: bool,
+    include_diagnostic_trials: bool,
+) -> bool:
+    if trial.condition == "blank":
+        return include_blank_trials
+    if _is_diagnostic_trial(trial):
+        return include_diagnostic_trials
+    return trial.condition == "speech"
+
+
 def _split_trials(
     trials: Sequence[TaskTrial],
     *,
@@ -226,6 +243,7 @@ class ChineseSpeechBuilder:
         val_fraction: float = 0.1,
         test_fraction: float = 0.1,
         include_blank_trials: bool = False,
+        include_diagnostic_trials: bool = False,
         overwrite: bool = False,
         n_electrodes: int = N_ELECTRODES,
     ) -> None:
@@ -236,6 +254,7 @@ class ChineseSpeechBuilder:
         self.val_fraction = val_fraction
         self.test_fraction = test_fraction
         self.include_blank_trials = include_blank_trials
+        self.include_diagnostic_trials = include_diagnostic_trials
         self.overwrite = overwrite
         self.n_electrodes = n_electrodes
 
@@ -251,8 +270,16 @@ class ChineseSpeechBuilder:
         lexicon = load_default_pronunciation_lexicon()
         task_trials = load_task_trials(self.csv_path)
         labeled_trials = [
-            trial for trial in task_trials if trial.condition == "speech" or self.include_blank_trials
+            trial
+            for trial in task_trials
+            if _is_included_trial(
+                trial,
+                include_blank_trials=self.include_blank_trials,
+                include_diagnostic_trials=self.include_diagnostic_trials,
+            )
         ]
+        if not labeled_trials:
+            raise ValueError(f"No included speech trials found in {self.session_dir}")
         schema = LabelSchema.from_texts([trial.text for trial in labeled_trials if trial.text], lexicon)
         split_by_trial = _split_trials(
             labeled_trials,
@@ -288,11 +315,29 @@ class ChineseSpeechBuilder:
 
                 rolling = RollingChannelStats(self.n_electrodes, HISTORY_TRIALS)
                 for task_trial in task_trials:
+                    if _is_diagnostic_trial(task_trial) and not self.include_diagnostic_trials:
+                        manifest_rows.append(
+                            {
+                                "subject": self.subject,
+                                "session": self.session_dir.name,
+                                "output_session": _session_output_name(self.session_dir.name),
+                                "trial_num": task_trial.trial_num,
+                                "block_num": task_trial.block_num,
+                                "sentence_label": task_trial.text,
+                                "condition": "diagnostic",
+                                "split": "excluded_diagnostic",
+                                "hdf5_group": "",
+                                "pronunciation": "",
+                            }
+                        )
+                        continue
+
                     if task_trial.condition == "blank" and not self.include_blank_trials:
                         manifest_rows.append(
                             {
                                 "subject": self.subject,
                                 "session": self.session_dir.name,
+                                "output_session": _session_output_name(self.session_dir.name),
                                 "trial_num": task_trial.trial_num,
                                 "block_num": task_trial.block_num,
                                 "sentence_label": "",
@@ -390,6 +435,7 @@ class ChineseSpeechBuilder:
             schema=schema,
             n_task_trials=len(task_trials),
             n_labeled_trials=len(labeled_trials),
+            n_diagnostic_trials=sum(1 for trial in task_trials if _is_diagnostic_trial(trial)),
             split_counts=split_counts,
             dead_electrodes=dead_electrodes,
             read_bins=read_bins,
@@ -403,6 +449,7 @@ class ChineseSpeechBuilder:
             "output_dir": str(output_dir),
             "n_task_trials": len(task_trials),
             "n_labeled_trials": len(labeled_trials),
+            "n_diagnostic_trials": sum(1 for trial in task_trials if _is_diagnostic_trial(trial)),
             "n_blank_trials": len(task_trials) - len([trial for trial in task_trials if trial.condition == "speech"]),
             "split_counts": split_counts,
             "metadata": metadata,
@@ -434,6 +481,7 @@ class ChineseSpeechBuilder:
         schema: LabelSchema,
         n_task_trials: int,
         n_labeled_trials: int,
+        n_diagnostic_trials: int,
         split_counts: Mapping[str, int],
         dead_electrodes: Sequence[int],
         read_bins: Sequence[int],
@@ -453,6 +501,8 @@ class ChineseSpeechBuilder:
             "n_task_trials": int(n_task_trials),
             "n_labeled_trials": int(n_labeled_trials),
             "include_blank_trials": bool(self.include_blank_trials),
+            "include_diagnostic_trials": bool(self.include_diagnostic_trials),
+            "n_diagnostic_trials": int(n_diagnostic_trials),
             "n_train": int(split_counts.get("train", 0)),
             "n_val": int(split_counts.get("val", 0)),
             "n_test": int(split_counts.get("test", 0)),
@@ -461,7 +511,7 @@ class ChineseSpeechBuilder:
                 "train_fraction": 1.0 - self.val_fraction - self.test_fraction,
                 "val_fraction": self.val_fraction,
                 "test_fraction": self.test_fraction,
-                "mode": "random_per_session_labeled_trials_only",
+                "mode": "random_per_session_included_sentence_trials_only",
             },
             "features": {
                 "mode": "electrode_sorted_spike_aggregation",
@@ -506,14 +556,26 @@ def build_all_sessions(
     overwrite: bool,
     split_seed: int,
     include_blank_trials: bool,
+    include_diagnostic_trials: bool = False,
 ) -> List[Dict[str, object]]:
     results = []
     for session in discover_chinese_sessions(speech_root):
+        task_trials = load_task_trials(session.csv_path)
+        if not any(
+            _is_included_trial(
+                trial,
+                include_blank_trials=include_blank_trials,
+                include_diagnostic_trials=include_diagnostic_trials,
+            )
+            for trial in task_trials
+        ):
+            continue
         builder = ChineseSpeechBuilder(
             session_dir=session.session_dir,
             output_root=output_root,
             split_seed=split_seed,
             include_blank_trials=include_blank_trials,
+            include_diagnostic_trials=include_diagnostic_trials,
             overwrite=overwrite,
         )
         results.append(builder.build())
@@ -536,6 +598,7 @@ def main() -> None:
     parser.add_argument("--session", type=str, default=None, help="Optional single session folder name.")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--include-blank-trials", action="store_true")
+    parser.add_argument("--include-diagnostic-trials", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -550,16 +613,42 @@ def main() -> None:
         for session in sessions:
             trials = load_task_trials(session.csv_path)
             n_speech = sum(1 for trial in trials if trial.condition == "speech")
-            print(f"{session.session_name}: trials={len(trials)} speech={n_speech} blank={len(trials)-n_speech}")
+            n_diagnostic = sum(1 for trial in trials if _is_diagnostic_trial(trial))
+            n_included = sum(
+                1
+                for trial in trials
+                if _is_included_trial(
+                    trial,
+                    include_blank_trials=args.include_blank_trials,
+                    include_diagnostic_trials=args.include_diagnostic_trials,
+                )
+            )
+            print(
+                f"{session.session_name}: trials={len(trials)} speech={n_speech} "
+                f"sentence={n_speech-n_diagnostic} diagnostic={n_diagnostic} "
+                f"blank={len(trials)-n_speech} included={n_included}"
+            )
         return
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     for session in sessions:
+        task_trials = load_task_trials(session.csv_path)
+        if not any(
+            _is_included_trial(
+                trial,
+                include_blank_trials=args.include_blank_trials,
+                include_diagnostic_trials=args.include_diagnostic_trials,
+            )
+            for trial in task_trials
+        ):
+            print(f"[skip] {session.session_name} has no included sentence trials")
+            continue
         result = ChineseSpeechBuilder(
             session_dir=session.session_dir,
             output_root=args.output_root,
             split_seed=args.seed,
             include_blank_trials=args.include_blank_trials,
+            include_diagnostic_trials=args.include_diagnostic_trials,
             overwrite=args.overwrite,
         ).build()
         counts = result["split_counts"]
