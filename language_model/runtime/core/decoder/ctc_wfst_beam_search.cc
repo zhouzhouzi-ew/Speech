@@ -164,24 +164,32 @@ void CtcWfstBeamSearch::ConvertToInputs(const std::vector<int>& alignment,
                                         std::vector<int>* time) {
   input->clear();
   if (time != nullptr) time->clear();
-  int cur = 0;
+
+  size_t cur = 0;
   while (cur < alignment.size()) {
     // ignore blank
     while (cur < alignment.size() && alignment[cur] - 1 == 0) {
       ++cur;
     }
+
     // merge continuous same label
-    while (cur - 1 < alignment.size() && alignment[cur + 1] == alignment[cur]) {
+    while (cur + 1 < alignment.size() &&
+           alignment[cur + 1] == alignment[cur]) {
       ++cur;
     }
+
     if (cur < alignment.size()) {
       input->push_back(alignment[cur] - 1);
+
       if (time != nullptr) {
+        CHECK_LT(cur, decoded_frames_mapping_.size());
         time->push_back(decoded_frames_mapping_[cur]);
       }
+
       ++cur;
     }
   }
 }
+
 
 }  // namespace wenet
