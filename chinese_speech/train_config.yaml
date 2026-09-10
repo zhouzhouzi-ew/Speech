@@ -8,7 +8,7 @@ data:
   sessions: all
   batch_size: 32
   num_workers: 0
-  expected_feature_dim: 256
+  expected_feature_dim: 512  # [TC(256) | SBP(256)], matches builder feature_type tc_sbp_512_*
 
 model:
   n_units: 768
