@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +13,6 @@ import h5py
 import numpy as np
 
 from chinese_speech.labels import (
-    BLANK_TOKEN,
     SIL_TOKEN,
     LabelSchema,
     Pronunciation,
@@ -21,746 +20,1280 @@ from chinese_speech.labels import (
     normalize_chinese_text,
 )
 
-N_ELECTRODES = 256
-BIN_SIZE_MS = 20
-HISTORY_TRIALS = 20
-STD_FLOOR = 0.05
-Z_CLIP = 20.0
 
+# ============================================================================
+# Defaults
+# ============================================================================
+#
+# Windows:
+#   D:\wwl\data\self_mat\chinese_hdf5_self
+#
+# WSL automatically mounts D: under /mnt/d, so the same folder is:
+#   /mnt/d/wwl/data/self_mat/chinese_hdf5_self
+#
+# Output requested for this project:
+#   /home/speech/nejm-brain-to-text-cn/data/hdf5_chinese
+#
+DEFAULT_SOURCE_ROOT = Path("/mnt/d/wwl/data/self_mat/chinese_hdf5_self")
+DEFAULT_OUTPUT_ROOT = Path("/home/speech/nejm-brain-to-text-cn/data/hdf5_chinese")
+
+EXPECTED_SPLITS = ("train", "val", "test")
+N_INPUT_FEATURES = 512
+
+# Raw MATLAB session folders are expected to look like:
+#   20260824-143620
+#   20260824-xxxxxx
+SESSION_RE = re.compile(
+    r"^(?P<date>\d{8})-(?P<time>\d{6})(?:[-_].*)?$"
+)
+
+
+# ============================================================================
+# Data classes
+# ============================================================================
 
 @dataclass(frozen=True)
-class ChineseSession:
-    session_name: str
+class MatlabSession:
+    raw_name: str
     session_dir: Path
-    csv_path: Path
-    trial_data_path: Path
-    config_path: Optional[Path]
+    date_compact: str       # e.g. 20260824
+    time_compact: str       # e.g. 143620
+    session_code: str       # S2 or S4
+    output_name: str        # t15.2026.08.24.S2_zh_syllable_tone
+    mat_paths: Mapping[str, Path]
+    manifest_path: Path
 
 
 @dataclass(frozen=True)
-class TaskTrial:
+class ManifestTrial:
+    global_id: int
+    task_trial_id: int
     trial_num: int
+    block_index: int
     block_num: int
-    text: str
-    condition: str
+    split: str
+    sentence_label: str
+    calibration_source_type: str
+    calibration_source_block_num: Optional[float]
+    read_begin: str
+    read_end: str
+    n_20ms_bins: Optional[int]
+    max_ptp_gap_ms: Optional[float]
 
 
-@dataclass(frozen=True)
-class NormalizationStats:
-    date: str
-    n_trials: int
-    n_samples: int
-    mean: np.ndarray
-    std: np.ndarray
+# ============================================================================
+# Small helpers
+# ============================================================================
+
+def _parse_optional_int(value: object) -> Optional[int]:
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
 
-def discover_chinese_sessions(root: Path) -> List[ChineseSession]:
-    sessions: List[ChineseSession] = []
-    for session_dir in sorted(Path(root).iterdir()):
-        if not session_dir.is_dir():
-            continue
-        csv_files = sorted(session_dir.glob("data_*.csv"))
-        trial_data = session_dir / "trial_data.mat"
-        if not csv_files or not trial_data.exists():
-            continue
-        config_path = session_dir / "config.toml"
-        sessions.append(
-            ChineseSession(
-                session_name=session_dir.name,
-                session_dir=session_dir,
-                csv_path=csv_files[0],
-                trial_data_path=trial_data,
-                config_path=config_path if config_path.exists() else None,
-            )
-        )
-    return sessions
+def _parse_optional_float(value: object) -> Optional[float]:
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
-def load_task_trials(csv_path: Path) -> List[TaskTrial]:
-    trials: List[TaskTrial] = []
-    with open(csv_path, encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row.get("EventType") != "trial_start":
-                continue
-            trial_num = int(row["Data1"])
-            block_num = int(row["Data2"])
-            text = normalize_chinese_text(row.get("Data3", ""))
-            trials.append(
-                TaskTrial(
-                    trial_num=trial_num,
-                    block_num=block_num,
-                    text=text,
-                    condition="speech" if text else "blank",
-                )
-            )
-    return trials
+def _format_date(date_compact: str) -> str:
+    if len(date_compact) != 8 or not date_compact.isdigit():
+        raise ValueError(f"Invalid compact date: {date_compact}")
+    return (
+        f"{date_compact[0:4]}-"
+        f"{date_compact[4:6]}-"
+        f"{date_compact[6:8]}"
+    )
 
 
-def _session_output_name(session_name: str) -> str:
-    parts = session_name.split("-S", maxsplit=1)
-    if len(parts) != 2:
-        return f"sub01_zh_{session_name}_syllable_tone"
-    date, suffix = parts
-    date_part = date.replace("-", ".")
-    return f"t15.{date_part}.S{suffix}_zh_syllable_tone"
+def _format_date_dotted(date_compact: str) -> str:
+    return _format_date(date_compact).replace("-", ".")
 
 
-def _ensure_output_dir(path: Path, overwrite: bool) -> None:
-    if path.exists():
-        if not overwrite:
-            raise FileExistsError(f"Output directory already exists: {path}")
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def _build_trial_bounds(mask: np.ndarray) -> Dict[int, Tuple[int, int]]:
-    flat = np.asarray(mask).reshape(-1)
-    changes = np.flatnonzero(np.diff(flat) != 0) + 1
-    starts = np.concatenate(([0], changes))
-    ends = np.concatenate((changes, [flat.size]))
-    return {int(flat[start]): (int(start), int(end)) for start, end in zip(starts, ends)}
-
-
-def _read_windows(state_bin: np.ndarray, trial_bounds: Mapping[int, Tuple[int, int]]) -> Dict[int, Tuple[int, int]]:
-    state = np.asarray(state_bin).reshape(-1)
-    windows: Dict[int, Tuple[int, int]] = {}
-    for trial_num, (start, end) in trial_bounds.items():
-        trial_state = state[start:end]
-        read_indices = np.flatnonzero(trial_state == 2)
-        if read_indices.size == 0:
-            raise ValueError(f"Trial {trial_num} has no state_bin == 2 read region.")
-        windows[trial_num] = (start + int(read_indices[0]), start + int(read_indices[-1]) + 1)
-    return windows
-
-
-def _membership_from_electrodes(
-    array_channel_unit: np.ndarray,
-    neuron_mask: np.ndarray,
-    n_electrodes: int,
-) -> Tuple[np.ndarray, List[int], np.ndarray]:
-    valid_cols = np.flatnonzero(np.asarray(neuron_mask).reshape(-1) > 0)
-    if valid_cols.size == 0:
-        raise ValueError("No valid units found in neuron_mask.")
-
-    acu = np.asarray(array_channel_unit)
-    electrodes = acu[3, valid_cols].astype(int) - 1
-    if np.any((electrodes < 0) | (electrodes >= n_electrodes)):
-        bad = sorted(set((electrodes[(electrodes < 0) | (electrodes >= n_electrodes)] + 1).tolist()))
-        raise ValueError(f"Invalid electrode ids in array_channel_unit: {bad}")
-
-    membership = np.zeros((valid_cols.size, n_electrodes), dtype=np.float32)
-    membership[np.arange(valid_cols.size), electrodes] = 1.0
-    dead_electrodes = [idx + 1 for idx in range(n_electrodes) if not np.any(membership[:, idx])]
-    return membership, dead_electrodes, valid_cols
-
-
-def _electrode_features_for_trial(
-    *,
-    spike_bin: h5py.Dataset,
-    valid_cols: np.ndarray,
-    membership: np.ndarray,
-    start: int,
-    end: int,
-    trial_num: int,
-) -> Tuple[np.ndarray, int]:
-    raw_slice = np.asarray(spike_bin[start:end, :], dtype=np.float32)[:, valid_cols]
-    n_raw = raw_slice.shape[0]
-    n_bins = n_raw // BIN_SIZE_MS
-    if n_bins <= 0:
-        raise ValueError(f"Trial {trial_num} has no complete 20 ms bins.")
-    raw_slice = raw_slice[: n_bins * BIN_SIZE_MS]
-    binned_units = raw_slice.reshape(n_bins, BIN_SIZE_MS, valid_cols.size).sum(axis=1)
-    return binned_units @ membership, int(n_bins)
-
-
-def _encode_transcription(text: str) -> np.ndarray:
-    return np.frombuffer(text.encode("utf-8") + b"\0", dtype=np.uint8)
+def _session_output_name(date_compact: str, session_code: str) -> str:
+    return (
+        f"t15.{_format_date_dotted(date_compact)}."
+        f"{session_code}_zh_syllable_tone"
+    )
 
 
 def _pronunciation_string(pronunciation: Pronunciation) -> str:
     return " ".join(f"{syllable}{tone}" for syllable, tone in pronunciation)
 
 
-def _is_diagnostic_trial(trial: TaskTrial) -> bool:
-    return trial.condition == "speech" and len(trial.text) <= 1
+def _encode_transcription(text: str) -> np.ndarray:
+    return np.frombuffer(text.encode("utf-8") + b"\0", dtype=np.uint8)
 
 
-def _is_included_trial(
-    trial: TaskTrial,
-    *,
-    include_blank_trials: bool,
-    include_diagnostic_trials: bool,
-) -> bool:
-    if trial.condition == "blank":
-        return include_blank_trials
-    if _is_diagnostic_trial(trial):
-        return include_diagnostic_trials
-    return trial.condition == "speech"
+def _ensure_clean_output_dir(path: Path, overwrite: bool) -> bool:
+    """
+    Return True when the caller should build this output directory.
+
+    Default incremental behavior:
+      - existing output + overwrite=False -> skip it
+      - overwrite=True -> remove and rebuild
+    """
+    if path.exists():
+        if not overwrite:
+            print(f"[skip] output already exists: {path}")
+            return False
+        shutil.rmtree(path)
+
+    path.mkdir(parents=True, exist_ok=True)
+    return True
 
 
-def _included_trials(
-    trials: Sequence[TaskTrial],
-    *,
-    include_blank_trials: bool,
-    include_diagnostic_trials: bool,
-) -> List[TaskTrial]:
-    return [
-        trial
-        for trial in trials
-        if _is_included_trial(
-            trial,
-            include_blank_trials=include_blank_trials,
-            include_diagnostic_trials=include_diagnostic_trials,
+# ============================================================================
+# Session discovery and S2/S4 assignment
+# ============================================================================
+
+def discover_matlab_sessions(source_root: Path) -> List[MatlabSession]:
+    """
+    Scan immediate subfolders of source_root.
+
+    Per-day mapping rule requested:
+      first chronological folder  -> S2
+      second chronological folder -> S4
+
+    If more than two valid folders are present on one day, only the first two
+    are assigned because no rule for a third session was specified.
+    """
+    source_root = Path(source_root)
+    if not source_root.exists():
+        raise FileNotFoundError(
+            "Source root does not exist. In WSL, Windows D: should normally be "
+            f"mounted under /mnt/d.\nSource root: {source_root}"
         )
-    ]
 
+    candidates: List[Tuple[str, str, str, Path]] = []
 
-def compute_normalization_stats_by_date(
-    sessions: Sequence[ChineseSession],
-    *,
-    n_electrodes: int = N_ELECTRODES,
-    include_blank_trials: bool = False,
-    include_diagnostic_trials: bool = False,
-    calibration_trials: int = HISTORY_TRIALS,
-) -> Dict[str, NormalizationStats]:
-    if calibration_trials <= 0:
-        raise ValueError("calibration_trials must be positive")
-
-    features_by_date: Dict[str, List[np.ndarray]] = {}
-    for session in sorted(sessions, key=lambda item: item.session_name):
-        date = session.session_name[:10]
-        if len(features_by_date.get(date, [])) >= calibration_trials:
+    for session_dir in sorted(source_root.iterdir(), key=lambda p: p.name):
+        if not session_dir.is_dir():
             continue
 
-        task_trials = _included_trials(
-            load_task_trials(session.csv_path),
-            include_blank_trials=include_blank_trials,
-            include_diagnostic_trials=include_diagnostic_trials,
-        )
-        if not task_trials:
-            continue
-
-        with h5py.File(session.trial_data_path, "r") as raw:
-            membership, _dead_electrodes, valid_cols = _membership_from_electrodes(
-                raw["array_channel_unit"][:],
-                raw["neuron_mask"][:],
-                n_electrodes,
+        match = SESSION_RE.match(session_dir.name)
+        if match is None:
+            print(
+                f"[skip] {session_dir.name}: folder name does not match "
+                "YYYYMMDD-HHMMSS"
             )
-            spike_bin = raw["spike_bin"]
-            trial_bounds = _build_trial_bounds(raw["trial_mask"][:])
-            windows = _read_windows(raw["state_bin"][:], trial_bounds)
-            collected = features_by_date.setdefault(date, [])
-
-            for trial in task_trials:
-                if len(collected) >= calibration_trials:
-                    break
-                if trial.trial_num not in windows:
-                    raise ValueError(f"CSV trial {trial.trial_num} not present in trial_mask.")
-                start, end = windows[trial.trial_num]
-                features, _n_bins = _electrode_features_for_trial(
-                    spike_bin=spike_bin,
-                    valid_cols=valid_cols,
-                    membership=membership,
-                    start=start,
-                    end=end,
-                    trial_num=trial.trial_num,
-                )
-                collected.append(features.astype(np.float32))
-
-    stats_by_date: Dict[str, NormalizationStats] = {}
-    for date, feature_list in features_by_date.items():
-        if not feature_list:
             continue
-        stacked = np.concatenate(feature_list, axis=0).astype(np.float64)
-        std = np.maximum(stacked.std(axis=0), STD_FLOOR)
-        stats_by_date[date] = NormalizationStats(
-            date=date,
-            n_trials=len(feature_list),
-            n_samples=int(stacked.shape[0]),
-            mean=stacked.mean(axis=0).astype(np.float32),
-            std=std.astype(np.float32),
+
+        date_compact = match.group("date")
+        time_compact = match.group("time")
+
+        mat_paths = {
+            split: session_dir / f"data_{split}.mat"
+            for split in EXPECTED_SPLITS
+            if (session_dir / f"data_{split}.mat").is_file()
+        }
+
+        # Requested behavior: folders with no .mat are simply ignored.
+        any_mat = any(session_dir.glob("*.mat"))
+        if not any_mat:
+            print(f"[skip] {session_dir.name}: no .mat files")
+            continue
+
+        # We specifically know how to convert the MATLAB preprocessing outputs
+        # data_train.mat / data_val.mat / data_test.mat.
+        if not mat_paths:
+            print(
+                f"[skip] {session_dir.name}: .mat exists, but none of "
+                "data_train.mat/data_val.mat/data_test.mat were found"
+            )
+            continue
+
+        manifest_path = session_dir / "trial_manifest.csv"
+        if not manifest_path.is_file():
+            print(
+                f"[skip] {session_dir.name}: missing trial_manifest.csv "
+                "(needed to map global_id to sentence labels)"
+            )
+            continue
+
+        candidates.append(
+            (date_compact, time_compact, session_dir.name, session_dir)
         )
-    return stats_by_date
+
+    # Group by day, then sort each day chronologically.
+    grouped: Dict[str, List[Tuple[str, str, Path]]] = {}
+    for date_compact, time_compact, raw_name, session_dir in candidates:
+        grouped.setdefault(date_compact, []).append(
+            (time_compact, raw_name, session_dir)
+        )
+
+    sessions: List[MatlabSession] = []
+
+    for date_compact in sorted(grouped):
+        day_sessions = sorted(
+            grouped[date_compact],
+            key=lambda x: (x[0], x[1]),
+        )
+
+        if len(day_sessions) > 2:
+            extras = ", ".join(item[1] for item in day_sessions[2:])
+            print(
+                f"[warn] {date_compact}: found {len(day_sessions)} convertible "
+                f"sessions. Only first two are mapped (S2/S4); extra folders "
+                f"will be skipped: {extras}"
+            )
+
+        for day_index, (time_compact, raw_name, session_dir) in enumerate(
+            day_sessions[:2]
+        ):
+            session_code = "S2" if day_index == 0 else "S4"
+
+            mat_paths = {
+                split: session_dir / f"data_{split}.mat"
+                for split in EXPECTED_SPLITS
+                if (session_dir / f"data_{split}.mat").is_file()
+            }
+
+            sessions.append(
+                MatlabSession(
+                    raw_name=raw_name,
+                    session_dir=session_dir,
+                    date_compact=date_compact,
+                    time_compact=time_compact,
+                    session_code=session_code,
+                    output_name=_session_output_name(
+                        date_compact, session_code
+                    ),
+                    mat_paths=mat_paths,
+                    manifest_path=session_dir / "trial_manifest.csv",
+                )
+            )
+
+    return sessions
 
 
-def _split_trials(
-    trials: Sequence[TaskTrial],
+# ============================================================================
+# Manifest loading
+# ============================================================================
+
+def load_trial_manifest(path: Path) -> Dict[int, ManifestTrial]:
+    rows: Dict[int, ManifestTrial] = {}
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+
+        required = {
+            "global_id",
+            "trial_num",
+            "block_num",
+            "split",
+            "sentence_label",
+        }
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"{path} is missing required columns: {sorted(missing)}"
+            )
+
+        for raw in reader:
+            global_id = int(raw["global_id"])
+            if global_id in rows:
+                raise ValueError(
+                    f"Duplicate global_id={global_id} in {path}"
+                )
+
+            rows[global_id] = ManifestTrial(
+                global_id=global_id,
+                task_trial_id=int(raw.get("task_trial_id", global_id)),
+                trial_num=int(raw["trial_num"]),
+                block_index=int(raw.get("block_index", 0) or 0),
+                block_num=int(float(raw["block_num"])),
+                split=str(raw["split"]).strip(),
+                sentence_label=normalize_chinese_text(
+                    raw.get("sentence_label", "")
+                ),
+                calibration_source_type=str(
+                    raw.get("calibration_source_type", "")
+                ).strip(),
+                calibration_source_block_num=_parse_optional_float(
+                    raw.get("calibration_source_block_num", "")
+                ),
+                read_begin=str(raw.get("read_begin", "")).strip(),
+                read_end=str(raw.get("read_end", "")).strip(),
+                n_20ms_bins=_parse_optional_int(
+                    raw.get("n_20ms_bins", "")
+                ),
+                max_ptp_gap_ms=_parse_optional_float(
+                    raw.get("max_ptp_gap_ms", "")
+                ),
+            )
+
+    return rows
+
+
+# ============================================================================
+# MATLAB v7.3 / HDF5 readers
+# ============================================================================
+
+def _require_dataset_group(handle: h5py.File) -> h5py.Group:
+    if "dataset" not in handle:
+        raise KeyError(
+            "Top-level MATLAB variable 'dataset' was not found. "
+            "Expected files created by save(..., 'dataset', '-v7.3')."
+        )
+
+    group = handle["dataset"]
+    if not isinstance(group, h5py.Group):
+        raise TypeError("'dataset' exists but is not an HDF5 group.")
+
+    return group
+
+
+def _matlab_numeric_vector(
+    group: h5py.Group,
+    field_name: str,
+    dtype: np.dtype,
+) -> np.ndarray:
+    if field_name not in group:
+        raise KeyError(
+            f"MATLAB dataset is missing field '{field_name}'."
+        )
+
+    obj = group[field_name]
+    if not isinstance(obj, h5py.Dataset):
+        raise TypeError(
+            f"dataset.{field_name} is not an HDF5 dataset."
+        )
+
+    ref_type = h5py.check_dtype(ref=obj.dtype)
+    if ref_type is not None:
+        raise TypeError(
+            f"dataset.{field_name} unexpectedly contains object references."
+        )
+
+    values = np.asarray(obj)
+    # MATLAB column vectors often appear as 1 x N through h5py because
+    # MATLAB v7.3 stores dimensions in HDF5 order. Flattening is sufficient
+    # for these scalar-per-trial fields.
+    return values.reshape(-1).astype(dtype, copy=False)
+
+
+def _matlab_cell_references(
+    group: h5py.Group,
+    field_name: str,
+) -> np.ndarray:
+    if field_name not in group:
+        raise KeyError(
+            f"MATLAB dataset is missing cell field '{field_name}'."
+        )
+
+    obj = group[field_name]
+    if not isinstance(obj, h5py.Dataset):
+        raise TypeError(
+            f"dataset.{field_name} is not an HDF5 dataset."
+        )
+
+    if h5py.check_dtype(ref=obj.dtype) is None:
+        raise TypeError(
+            f"dataset.{field_name} is expected to be a MATLAB cell array "
+            "(HDF5 object references)."
+        )
+
+    return np.asarray(obj).reshape(-1)
+
+
+def _orient_trial_matrix(
+    array: np.ndarray,
     *,
-    seed: int,
-    val_fraction: float,
-    test_fraction: float,
-) -> Dict[int, str]:
-    rng = np.random.default_rng(seed)
-    trial_nums = np.asarray([trial.trial_num for trial in trials], dtype=int)
-    rng.shuffle(trial_nums)
-    n_total = len(trial_nums)
-    n_test = 0 if test_fraction <= 0 else max(1, int(math.floor(n_total * test_fraction)))
-    n_val = 0 if val_fraction <= 0 else max(1, int(math.floor(n_total * val_fraction)))
-    if n_val + n_test >= n_total:
-        raise ValueError(f"Invalid split fractions for {n_total} trials.")
-    split_by_trial = {int(x): "test" for x in trial_nums[:n_test]}
-    split_by_trial.update({int(x): "val" for x in trial_nums[n_test : n_test + n_val]})
-    split_by_trial.update({int(x): "train" for x in trial_nums[n_test + n_val :]})
-    return split_by_trial
+    n_features: int,
+    field_name: str,
+    global_id: int,
+) -> np.ndarray:
+    """
+    Recover the MATLAB T x F orientation.
 
+    MATLAB v7.3 matrices are commonly exposed by h5py with reversed
+    dimensions, so a MATLAB T x 512 matrix is usually seen as 512 x T.
+    """
+    array = np.asarray(array)
+
+    if array.ndim == 1:
+        if array.size != n_features:
+            raise ValueError(
+                f"global_id={global_id} {field_name}: one-dimensional array "
+                f"has {array.size} values; expected {n_features}."
+            )
+        array = array.reshape(1, n_features)
+
+    if array.ndim != 2:
+        raise ValueError(
+            f"global_id={global_id} {field_name}: expected a 2-D matrix, "
+            f"got shape {array.shape}."
+        )
+
+    if array.shape[1] == n_features:
+        result = array
+    elif array.shape[0] == n_features:
+        result = array.T
+    else:
+        raise ValueError(
+            f"global_id={global_id} {field_name}: cannot identify feature "
+            f"dimension {n_features} from HDF5 shape {array.shape}."
+        )
+
+    if result.shape[0] <= 0:
+        raise ValueError(
+            f"global_id={global_id} {field_name}: no time bins."
+        )
+
+    if not np.all(np.isfinite(result)):
+        raise ValueError(
+            f"global_id={global_id} {field_name}: contains NaN or Inf."
+        )
+
+    return np.asarray(result, dtype=np.float32)
+
+
+def _read_feature_ref(
+    handle: h5py.File,
+    ref: h5py.Reference,
+    *,
+    global_id: int,
+) -> np.ndarray:
+    if not ref:
+        raise ValueError(
+            f"global_id={global_id}: empty HDF5 reference in input_features."
+        )
+
+    obj = handle[ref]
+    if not isinstance(obj, h5py.Dataset):
+        raise TypeError(
+            f"global_id={global_id}: input_features cell does not reference "
+            "an HDF5 dataset."
+        )
+
+    return _orient_trial_matrix(
+        np.asarray(obj),
+        n_features=N_INPUT_FEATURES,
+        field_name="input_features",
+        global_id=global_id,
+    )
+
+
+def inspect_mat_split(
+    mat_path: Path,
+) -> Tuple[np.ndarray, int]:
+    """
+    Return ordered global_ids and number of input_features cells.
+    """
+    try:
+        with h5py.File(mat_path, "r") as handle:
+            group = _require_dataset_group(handle)
+            global_ids = _matlab_numeric_vector(
+                group, "global_id", np.int64
+            )
+            refs = _matlab_cell_references(
+                group, "input_features"
+            )
+    except OSError as exc:
+        raise OSError(
+            f"{mat_path} is not readable as MATLAB v7.3/HDF5. "
+            "The source MATLAB script should save with -v7.3."
+        ) from exc
+
+    if global_ids.size != refs.size:
+        raise ValueError(
+            f"{mat_path}: global_id has {global_ids.size} trials but "
+            f"input_features has {refs.size} cells."
+        )
+
+    return global_ids, int(refs.size)
+
+
+# ============================================================================
+# HDF5 conversion
+# ============================================================================
 
 class ChineseSpeechBuilder:
     def __init__(
         self,
         *,
-        session_dir: Path,
+        session: MatlabSession,
         output_root: Path,
         subject: str = "sub-01",
-        split_seed: int = 1,
-        val_fraction: float = 0.1,
-        test_fraction: float = 0.1,
-        include_blank_trials: bool = False,
-        include_diagnostic_trials: bool = False,
-        normalization_stats: Optional[NormalizationStats] = None,
         overwrite: bool = False,
-        n_electrodes: int = N_ELECTRODES,
     ) -> None:
-        self.session_dir = Path(session_dir)
+        self.session = session
         self.output_root = Path(output_root)
         self.subject = subject
-        self.split_seed = split_seed
-        self.val_fraction = val_fraction
-        self.test_fraction = test_fraction
-        self.include_blank_trials = include_blank_trials
-        self.include_diagnostic_trials = include_diagnostic_trials
-        self.normalization_stats = normalization_stats
         self.overwrite = overwrite
-        self.n_electrodes = n_electrodes
 
-        csv_files = sorted(self.session_dir.glob("data_*.csv"))
-        if not csv_files:
-            raise FileNotFoundError(f"No data_*.csv found in {self.session_dir}")
-        self.csv_path = csv_files[0]
-        self.trial_data_path = self.session_dir / "trial_data.mat"
-        if not self.trial_data_path.exists():
-            raise FileNotFoundError(f"Missing trial_data.mat in {self.session_dir}")
+    def build(self) -> Optional[Dict[str, object]]:
+        output_dir = self.output_root / self.session.output_name
 
-    def build(self) -> Dict[str, object]:
-        lexicon = load_default_pronunciation_lexicon()
-        task_trials = load_task_trials(self.csv_path)
-        labeled_trials = _included_trials(
-            task_trials,
-            include_blank_trials=self.include_blank_trials,
-            include_diagnostic_trials=self.include_diagnostic_trials,
-        )
-        if not labeled_trials:
-            raise ValueError(f"No included speech trials found in {self.session_dir}")
-        normalization_stats = self.normalization_stats
-        if normalization_stats is None:
-            session = ChineseSession(
-                session_name=self.session_dir.name,
-                session_dir=self.session_dir,
-                csv_path=self.csv_path,
-                trial_data_path=self.trial_data_path,
-                config_path=None,
-            )
-            stats_by_date = compute_normalization_stats_by_date(
-                [session],
-                n_electrodes=self.n_electrodes,
-                include_blank_trials=self.include_blank_trials,
-                include_diagnostic_trials=self.include_diagnostic_trials,
-            )
-            normalization_stats = stats_by_date.get(self.session_dir.name[:10])
-        if normalization_stats is None:
-            raise ValueError(f"No z-score calibration trials found for {self.session_dir.name[:10]}")
-        if normalization_stats.mean.shape[-1] != self.n_electrodes:
-            raise ValueError(
-                f"Normalization stats have {normalization_stats.mean.shape[-1]} channels, "
-                f"but builder expected {self.n_electrodes}."
-            )
-        schema = LabelSchema.from_texts([trial.text for trial in labeled_trials if trial.text], lexicon)
-        split_by_trial = _split_trials(
-            labeled_trials,
-            seed=self.split_seed,
-            val_fraction=self.val_fraction,
-            test_fraction=self.test_fraction,
-        )
-
-        output_dir = self.output_root / _session_output_name(self.session_dir.name)
-        _ensure_output_dir(output_dir, overwrite=self.overwrite)
-
-        h5_handles = {
-            "train": h5py.File(output_dir / "data_train.hdf5", "w"),
-            "val": h5py.File(output_dir / "data_val.hdf5", "w"),
-            "test": h5py.File(output_dir / "data_test.hdf5", "w"),
-        }
-        split_counts = {"train": 0, "val": 0, "test": 0}
-        manifest_rows: List[Dict[str, object]] = []
-        read_bins: List[int] = []
-        max_abs_z = 0.0
+        if not _ensure_clean_output_dir(
+            output_dir, overwrite=self.overwrite
+        ):
+            return None
 
         try:
-            with h5py.File(self.trial_data_path, "r") as raw:
-                membership, dead_electrodes, valid_cols = _membership_from_electrodes(
-                    raw["array_channel_unit"][:],
-                    raw["neuron_mask"][:],
-                    self.n_electrodes,
+            manifest = load_trial_manifest(
+                self.session.manifest_path
+            )
+
+            # Inspect available split MAT files first. This gives us the exact
+            # trial IDs actually present in each MAT and lets us build one
+            # consistent label schema for train/val/test.
+            split_global_ids: Dict[str, np.ndarray] = {}
+            all_global_ids: List[int] = []
+
+            for split in EXPECTED_SPLITS:
+                mat_path = self.session.mat_paths.get(split)
+                if mat_path is None:
+                    print(
+                        f"[warn] {self.session.raw_name}: "
+                        f"data_{split}.mat is missing; that split will not "
+                        "be written"
+                    )
+                    continue
+
+                global_ids, _ = inspect_mat_split(mat_path)
+                split_global_ids[split] = global_ids
+                all_global_ids.extend(
+                    int(x) for x in global_ids.tolist()
                 )
-                spike_bin = raw["spike_bin"]
-                trial_bounds = _build_trial_bounds(raw["trial_mask"][:])
-                windows = _read_windows(raw["state_bin"][:], trial_bounds)
 
-                for task_trial in task_trials:
-                    if _is_diagnostic_trial(task_trial) and not self.include_diagnostic_trials:
-                        manifest_rows.append(
-                            {
-                                "subject": self.subject,
-                                "session": self.session_dir.name,
-                                "output_session": _session_output_name(self.session_dir.name),
-                                "trial_num": task_trial.trial_num,
-                                "block_num": task_trial.block_num,
-                                "sentence_label": task_trial.text,
-                                "condition": "diagnostic",
-                                "split": "excluded_diagnostic",
-                                "hdf5_group": "",
-                                "pronunciation": "",
-                            }
+            if not split_global_ids:
+                raise ValueError(
+                    f"{self.session.raw_name}: no convertible data_*.mat files."
+                )
+
+            if len(set(all_global_ids)) != len(all_global_ids):
+                raise ValueError(
+                    f"{self.session.raw_name}: the same global_id appears "
+                    "in more than one split MAT file."
+                )
+
+            missing_manifest = [
+                gid for gid in all_global_ids if gid not in manifest
+            ]
+            if missing_manifest:
+                preview = missing_manifest[:10]
+                raise ValueError(
+                    f"{self.session.raw_name}: MAT global_id values are missing "
+                    f"from trial_manifest.csv, e.g. {preview}"
+                )
+
+            # Check that the split stored in the manifest agrees with which
+            # MAT file the trial came from.
+            for split, gids in split_global_ids.items():
+                bad = [
+                    int(gid)
+                    for gid in gids
+                    if manifest[int(gid)].split
+                    and manifest[int(gid)].split != split
+                ]
+                if bad:
+                    raise ValueError(
+                        f"{self.session.raw_name}: manifest split disagrees "
+                        f"with data_{split}.mat for global_id(s) {bad[:10]}"
+                    )
+
+            texts = [
+                manifest[gid].sentence_label
+                for gid in all_global_ids
+                if manifest[gid].sentence_label
+            ]
+            if not texts:
+                raise ValueError(
+                    f"{self.session.raw_name}: no non-empty sentence labels "
+                    "found for the MAT trials."
+                )
+
+            lexicon = load_default_pronunciation_lexicon()
+            schema = LabelSchema.from_texts(texts, lexicon)
+
+            output_manifest_rows: List[Dict[str, object]] = []
+            split_counts: Dict[str, int] = {
+                "train": 0,
+                "val": 0,
+                "test": 0,
+            }
+            feature_lengths: List[int] = []
+            max_abs_input = 0.0
+
+            for split in EXPECTED_SPLITS:
+                mat_path = self.session.mat_paths.get(split)
+                if mat_path is None:
+                    continue
+
+                out_h5 = output_dir / f"data_{split}.hdf5"
+                count, rows, lengths, max_abs = self._convert_split(
+                    split=split,
+                    mat_path=mat_path,
+                    output_path=out_h5,
+                    manifest=manifest,
+                    schema=schema,
+                    lexicon=lexicon,
+                )
+
+                split_counts[split] = count
+                output_manifest_rows.extend(rows)
+                feature_lengths.extend(lengths)
+                max_abs_input = max(max_abs_input, max_abs)
+
+            self._write_manifest(
+                output_dir,
+                output_manifest_rows,
+            )
+            metadata = self._write_metadata(
+                output_dir,
+                schema=schema,
+                split_counts=split_counts,
+                feature_lengths=feature_lengths,
+                max_abs_input=max_abs_input,
+            )
+
+            return {
+                "raw_session": self.session.raw_name,
+                "session_code": self.session.session_code,
+                "output_session": self.session.output_name,
+                "output_dir": str(output_dir),
+                "split_counts": split_counts,
+                "metadata": metadata,
+            }
+
+        except Exception:
+            # Do not leave a half-built t15... folder behind. This is
+            # especially useful when the script is rerun incrementally.
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            raise
+
+    def _convert_split(
+        self,
+        *,
+        split: str,
+        mat_path: Path,
+        output_path: Path,
+        manifest: Mapping[int, ManifestTrial],
+        schema: LabelSchema,
+        lexicon,
+    ) -> Tuple[
+        int,
+        List[Dict[str, object]],
+        List[int],
+        float,
+    ]:
+        rows: List[Dict[str, object]] = []
+        lengths: List[int] = []
+        max_abs_input = 0.0
+
+        with h5py.File(mat_path, "r") as source, h5py.File(
+            output_path, "w"
+        ) as target:
+            group = _require_dataset_group(source)
+
+            global_ids = _matlab_numeric_vector(
+                group, "global_id", np.int64
+            )
+            feature_refs = _matlab_cell_references(
+                group, "input_features"
+            )
+
+            if global_ids.size != feature_refs.size:
+                raise ValueError(
+                    f"{mat_path}: global_id count {global_ids.size} != "
+                    f"input_features count {feature_refs.size}"
+                )
+
+            for local_index, (global_id_raw, feature_ref) in enumerate(
+                zip(global_ids.tolist(), feature_refs.tolist())
+            ):
+                global_id = int(global_id_raw)
+                trial = manifest[global_id]
+
+                features = _read_feature_ref(
+                    source,
+                    feature_ref,
+                    global_id=global_id,
+                )
+
+                if trial.n_20ms_bins is not None:
+                    if features.shape[0] != trial.n_20ms_bins:
+                        raise ValueError(
+                            f"{self.session.raw_name} global_id={global_id}: "
+                            f"MAT has {features.shape[0]} time bins but "
+                            f"manifest says {trial.n_20ms_bins}."
                         )
-                        continue
 
-                    if task_trial.condition == "blank" and not self.include_blank_trials:
-                        manifest_rows.append(
-                            {
-                                "subject": self.subject,
-                                "session": self.session_dir.name,
-                                "output_session": _session_output_name(self.session_dir.name),
-                                "trial_num": task_trial.trial_num,
-                                "block_num": task_trial.block_num,
-                                "sentence_label": "",
-                                "condition": "blank",
-                                "split": "no_action",
-                                "hdf5_group": "",
-                            }
-                        )
-                        continue
+                text = trial.sentence_label
 
-                    if task_trial.trial_num not in windows:
-                        raise ValueError(f"CSV trial {task_trial.trial_num} not present in trial_mask.")
-                    start, end = windows[task_trial.trial_num]
-                    electrode_features, n_bins = _electrode_features_for_trial(
-                        spike_bin=spike_bin,
-                        valid_cols=valid_cols,
-                        membership=membership,
-                        start=start,
-                        end=end,
-                        trial_num=task_trial.trial_num,
+                if text:
+                    encoded = schema.encode_text(text, lexicon)
+                    pronunciation = encoded.pronunciation
+                    syllable_ids = np.asarray(
+                        encoded.syllable_ids,
+                        dtype=np.int32,
                     )
-                    split = split_by_trial[task_trial.trial_num]
-
-                    features = np.clip(
-                        (electrode_features - normalization_stats.mean) / normalization_stats.std,
-                        -Z_CLIP,
-                        Z_CLIP,
+                    tone_ids = np.asarray(
+                        encoded.tone_ids,
+                        dtype=np.int32,
                     )
-                    max_abs_z = max(max_abs_z, float(np.abs(features).max()))
-                    read_bins.append(int(n_bins))
-
-                    if task_trial.text:
-                        encoded = schema.encode_text(task_trial.text, lexicon)
-                    else:
-                        sil_syllable = schema.syllable_to_id[SIL_TOKEN]
-                        sil_tone = schema.tone_to_id[SIL_TOKEN]
-                        encoded = type("EncodedBlank", (), {})()
-                        encoded.text = ""
-                        encoded.pronunciation = []
-                        encoded.syllable_ids = [sil_syllable]
-                        encoded.tone_ids = [sil_tone]
-
-                    group_name = f"trial_{split_counts[split]:04d}"
-                    group = h5_handles[split].create_group(group_name)
-                    group.create_dataset("input_features", data=features.astype(np.float32))
-                    group.create_dataset("seq_class_ids", data=np.asarray(encoded.syllable_ids, dtype=np.int32))
-                    group.create_dataset("seq_syllable_ids", data=np.asarray(encoded.syllable_ids, dtype=np.int32))
-                    group.create_dataset("seq_tone_ids", data=np.asarray(encoded.tone_ids, dtype=np.int32))
-                    group.create_dataset("transcription", data=_encode_transcription(task_trial.text))
-                    group.attrs["subject"] = self.subject
-                    group.attrs["session"] = _session_output_name(self.session_dir.name)
-                    group.attrs["raw_session"] = self.session_dir.name
-                    group.attrs["date"] = self.session_dir.name[:10]
-                    group.attrs["block_num"] = int(task_trial.block_num)
-                    group.attrs["trial_num"] = int(task_trial.trial_num)
-                    group.attrs["split"] = split
-                    group.attrs["corpus"] = "Mandarin"
-                    group.attrs["sentence_label"] = task_trial.text.encode("utf-8")
-                    group.attrs["n_time_steps"] = int(n_bins)
-                    group.attrs["seq_len"] = len(encoded.syllable_ids)
-                    group.attrs["tone_seq_len"] = len(encoded.tone_ids)
-                    group.attrs["feature_type"] = (
-                        "syllable_tone_electrode_zscore_fixed_day_first20_statebin_read_"
-                        "stdfloor0.05_clip20"
+                else:
+                    # Kept for robustness, although the current sentence MAT
+                    # files are expected to contain sentence trials.
+                    sil_syllable = schema.syllable_to_id[SIL_TOKEN]
+                    sil_tone = schema.tone_to_id[SIL_TOKEN]
+                    pronunciation = []
+                    syllable_ids = np.asarray(
+                        [sil_syllable], dtype=np.int32
                     )
-                    group.attrs["pronunciation"] = _pronunciation_string(encoded.pronunciation)
-                    group.attrs["target_syllables"] = " ".join(s for s, _ in encoded.pronunciation)
-                    group.attrs["target_tones"] = " ".join(str(t) for _, t in encoded.pronunciation)
-
-                    manifest_rows.append(
-                        {
-                            "subject": self.subject,
-                            "session": self.session_dir.name,
-                            "output_session": _session_output_name(self.session_dir.name),
-                            "trial_num": task_trial.trial_num,
-                            "block_num": task_trial.block_num,
-                            "sentence_label": task_trial.text,
-                            "condition": task_trial.condition,
-                            "split": split,
-                            "hdf5_group": group_name,
-                            "pronunciation": _pronunciation_string(encoded.pronunciation),
-                        }
+                    tone_ids = np.asarray(
+                        [sil_tone], dtype=np.int32
                     )
-                    split_counts[split] += 1
-        finally:
-            for handle in h5_handles.values():
-                handle.close()
 
-        self._write_manifest(output_dir, manifest_rows)
-        metadata = self._write_metadata(
-            output_dir,
-            schema=schema,
-            n_task_trials=len(task_trials),
-            n_labeled_trials=len(labeled_trials),
-            n_diagnostic_trials=sum(1 for trial in task_trials if _is_diagnostic_trial(trial)),
-            normalization_stats=normalization_stats,
-            split_counts=split_counts,
-            dead_electrodes=dead_electrodes,
-            read_bins=read_bins,
-            max_abs_z=max_abs_z,
+                group_name = f"trial_{local_index:04d}"
+                out_group = target.create_group(group_name)
+
+                # IMPORTANT: input_features already contains the final MATLAB
+                # preprocessing output:
+                #   T x 512 = [TC(256) | SBP(256)]
+                # and, for the uploaded preprocessing configuration, already
+                # includes the causal previous-20-trial z-score.
+                # Do NOT normalize it again here.
+                out_group.create_dataset(
+                    "input_features",
+                    data=features,
+                    dtype=np.float32,
+                )
+                out_group.create_dataset(
+                    "seq_class_ids",
+                    data=syllable_ids,
+                )
+                out_group.create_dataset(
+                    "seq_syllable_ids",
+                    data=syllable_ids,
+                )
+                out_group.create_dataset(
+                    "seq_tone_ids",
+                    data=tone_ids,
+                )
+                out_group.create_dataset(
+                    "transcription",
+                    data=_encode_transcription(text),
+                )
+
+                out_group.attrs["subject"] = self.subject
+                out_group.attrs["session"] = self.session.output_name
+                out_group.attrs["raw_session"] = self.session.raw_name
+                out_group.attrs["date"] = _format_date(
+                    self.session.date_compact
+                )
+                out_group.attrs["session_code"] = (
+                    self.session.session_code
+                )
+                out_group.attrs["global_id"] = global_id
+                out_group.attrs["task_trial_id"] = int(
+                    trial.task_trial_id
+                )
+                out_group.attrs["block_num"] = int(
+                    trial.block_num
+                )
+                out_group.attrs["trial_num"] = int(
+                    trial.trial_num
+                )
+                out_group.attrs["split"] = split
+                out_group.attrs["corpus"] = "Mandarin"
+                out_group.attrs["sentence_label"] = text.encode(
+                    "utf-8"
+                )
+                out_group.attrs["n_time_steps"] = int(
+                    features.shape[0]
+                )
+                out_group.attrs["n_input_features"] = int(
+                    features.shape[1]
+                )
+                out_group.attrs["seq_len"] = int(
+                    syllable_ids.size
+                )
+                out_group.attrs["tone_seq_len"] = int(
+                    tone_ids.size
+                )
+                out_group.attrs["feature_type"] = (
+                    "tc_sbp_512_prevblock_lrr_rms_prev20z"
+                )
+                out_group.attrs["feature_order"] = (
+                    "[TC physical electrodes 1:256 | "
+                    "SBP physical electrodes 1:256]"
+                )
+                out_group.attrs["source_mat"] = mat_path.name
+                out_group.attrs[
+                    "calibration_source_type"
+                ] = trial.calibration_source_type
+
+                if (
+                    trial.calibration_source_block_num
+                    is not None
+                ):
+                    out_group.attrs[
+                        "calibration_source_block_num"
+                    ] = float(
+                        trial.calibration_source_block_num
+                    )
+
+                pronunciation_text = _pronunciation_string(
+                    pronunciation
+                )
+                out_group.attrs[
+                    "pronunciation"
+                ] = pronunciation_text
+                out_group.attrs["target_syllables"] = " ".join(
+                    syllable for syllable, _ in pronunciation
+                )
+                out_group.attrs["target_tones"] = " ".join(
+                    str(tone) for _, tone in pronunciation
+                )
+
+                n_time_steps = int(features.shape[0])
+                lengths.append(n_time_steps)
+                max_abs_input = max(
+                    max_abs_input,
+                    float(np.max(np.abs(features))),
+                )
+
+                rows.append(
+                    {
+                        "subject": self.subject,
+                        "raw_session": self.session.raw_name,
+                        "output_session": self.session.output_name,
+                        "session_code": self.session.session_code,
+                        "global_id": global_id,
+                        "task_trial_id": trial.task_trial_id,
+                        "trial_num": trial.trial_num,
+                        "block_index": trial.block_index,
+                        "block_num": trial.block_num,
+                        "sentence_label": text,
+                        "split": split,
+                        "hdf5_group": group_name,
+                        "n_time_steps": n_time_steps,
+                        "read_begin": trial.read_begin,
+                        "read_end": trial.read_end,
+                        "calibration_source_type": (
+                            trial.calibration_source_type
+                        ),
+                        "calibration_source_block_num": (
+                            ""
+                            if trial.calibration_source_block_num
+                            is None
+                            else trial.calibration_source_block_num
+                        ),
+                        "pronunciation": pronunciation_text,
+                    }
+                )
+
+        return (
+            len(rows),
+            rows,
+            lengths,
+            max_abs_input,
         )
 
-        return {
-            "session": self.session_dir.name,
-            "output_session": _session_output_name(self.session_dir.name),
-            "output_dir": str(output_dir),
-            "n_task_trials": len(task_trials),
-            "n_labeled_trials": len(labeled_trials),
-            "n_diagnostic_trials": sum(1 for trial in task_trials if _is_diagnostic_trial(trial)),
-            "n_blank_trials": len(task_trials) - len([trial for trial in task_trials if trial.condition == "speech"]),
-            "split_counts": split_counts,
-            "metadata": metadata,
-        }
-
-    def _write_manifest(self, output_dir: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    def _write_manifest(
+        self,
+        output_dir: Path,
+        rows: Sequence[Mapping[str, object]],
+    ) -> None:
         fieldnames = [
             "subject",
-            "session",
+            "raw_session",
             "output_session",
+            "session_code",
+            "global_id",
+            "task_trial_id",
             "trial_num",
+            "block_index",
             "block_num",
             "sentence_label",
-            "condition",
             "split",
             "hdf5_group",
+            "n_time_steps",
+            "read_begin",
+            "read_end",
+            "calibration_source_type",
+            "calibration_source_block_num",
             "pronunciation",
         ]
-        with open(output_dir / "trial_manifest.csv", "w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+
+        with open(
+            output_dir / "trial_manifest.csv",
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=fieldnames
+            )
             writer.writeheader()
             for row in rows:
-                writer.writerow({name: row.get(name, "") for name in fieldnames})
+                writer.writerow(
+                    {
+                        name: row.get(name, "")
+                        for name in fieldnames
+                    }
+                )
 
     def _write_metadata(
         self,
         output_dir: Path,
         *,
         schema: LabelSchema,
-        n_task_trials: int,
-        n_labeled_trials: int,
-        n_diagnostic_trials: int,
-        normalization_stats: NormalizationStats,
         split_counts: Mapping[str, int],
-        dead_electrodes: Sequence[int],
-        read_bins: Sequence[int],
-        max_abs_z: float,
+        feature_lengths: Sequence[int],
+        max_abs_input: float,
     ) -> Dict[str, object]:
+        source_mats = {
+            split: str(path)
+            for split, path in self.session.mat_paths.items()
+        }
+
         metadata = {
             "subject": self.subject,
-            "session": _session_output_name(self.session_dir.name),
-            "raw_session": self.session_dir.name,
-            "date": self.session_dir.name[:10],
-            "source": {
-                "session_dir": str(self.session_dir),
-                "csv_path": str(self.csv_path),
-                "trial_data_path": str(self.trial_data_path),
+            "session": self.session.output_name,
+            "raw_session": self.session.raw_name,
+            "date": _format_date(
+                self.session.date_compact
+            ),
+            "session_code": self.session.session_code,
+            "session_assignment": {
+                "rule": (
+                    "within each date, first chronological "
+                    "convertible folder -> S2; second -> S4"
+                ),
+                "raw_time": self.session.time_compact,
             },
-            "n_task_trials": int(n_task_trials),
-            "n_labeled_trials": int(n_labeled_trials),
-            "include_blank_trials": bool(self.include_blank_trials),
-            "include_diagnostic_trials": bool(self.include_diagnostic_trials),
-            "n_diagnostic_trials": int(n_diagnostic_trials),
-            "n_train": int(split_counts.get("train", 0)),
-            "n_val": int(split_counts.get("val", 0)),
-            "n_test": int(split_counts.get("test", 0)),
+            "source": {
+                "session_dir": str(
+                    self.session.session_dir
+                ),
+                "trial_manifest_csv": str(
+                    self.session.manifest_path
+                ),
+                "mat_files": source_mats,
+            },
+            "n_train": int(
+                split_counts.get("train", 0)
+            ),
+            "n_val": int(
+                split_counts.get("val", 0)
+            ),
+            "n_test": int(
+                split_counts.get("test", 0)
+            ),
             "split": {
-                "seed": int(self.split_seed),
-                "train_fraction": 1.0 - self.val_fraction - self.test_fraction,
-                "val_fraction": self.val_fraction,
-                "test_fraction": self.test_fraction,
-                "mode": "random_per_session_included_sentence_trials_only",
+                "mode": (
+                    "preserve_existing_matlab_train_val_test_split"
+                ),
             },
             "features": {
-                "mode": "electrode_sorted_spike_aggregation",
-                "n_features": self.n_electrodes,
-                "n_electrodes": self.n_electrodes,
-                "dead_electrodes": list(dead_electrodes),
-                "bin_size_ms": BIN_SIZE_MS,
-                "read_window": "state_bin==2",
-                "normalization": "fixed_first20_included_trials_per_day_all_splits",
-                "normalization_date": normalization_stats.date,
-                "normalization_reference_trials": int(normalization_stats.n_trials),
-                "normalization_reference_samples": int(normalization_stats.n_samples),
-                "smoothing": "none_in_preprocessing",
+                "mode": (
+                    "direct_from_matlab_dataset.input_features"
+                ),
+                "n_features": N_INPUT_FEATURES,
+                "feature_order": (
+                    "[TC physical electrodes 1:256 | "
+                    "SBP physical electrodes 1:256]"
+                ),
+                "bin_size_ms": 20,
+                "normalization": (
+                    "already_applied_in_matlab_causal_prev20"
+                ),
+                "additional_python_normalization": False,
+                "time_bins_per_trial": {
+                    "min": (
+                        int(np.min(feature_lengths))
+                        if feature_lengths
+                        else 0
+                    ),
+                    "mean": (
+                        float(np.mean(feature_lengths))
+                        if feature_lengths
+                        else 0.0
+                    ),
+                    "max": (
+                        int(np.max(feature_lengths))
+                        if feature_lengths
+                        else 0
+                    ),
+                },
+                "max_abs_input_features": float(
+                    max_abs_input
+                ),
             },
             "labels": {
                 **schema.to_json(),
-                "blank_idx": schema.syllable_to_id[BLANK_TOKEN],
-                "sil_idx": schema.syllable_to_id[SIL_TOKEN],
-                "tone_blank_idx": schema.tone_to_id[BLANK_TOKEN],
-                "tone_sil_idx": schema.tone_to_id[SIL_TOKEN],
-                "scheme": "dual_stream_syllable_base_plus_tone_number_with_sil_start_end",
-                "pronunciation_source": "chinese_speech.labels built-in overrides; no tone sandhi except explicit phrase overrides",
-                "seq_class_ids_alias": "seq_syllable_ids",
-                "english_compatible": "seq_class_ids is present as the syllable stream only; use dual-stream training for tone.",
-            },
-            "zscore_stats": {
-                "read_bins_per_trial": {
-                    "min": int(np.min(read_bins)) if read_bins else 0,
-                    "mean": float(np.mean(read_bins)) if read_bins else 0.0,
-                    "max": int(np.max(read_bins)) if read_bins else 0,
-                },
-                "z_reference_trials": int(normalization_stats.n_trials),
-                "max_abs_z": float(max_abs_z),
+                "scheme": (
+                    "dual_stream_syllable_base_plus_"
+                    "tone_number_with_sil_start_end"
+                ),
+                "seq_class_ids_alias": (
+                    "seq_syllable_ids"
+                ),
             },
         }
-        with open(output_dir / "metadata.json", "w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+        with open(
+            output_dir / "metadata.json",
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                metadata,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+
         return metadata
 
 
+# ============================================================================
+# Batch build
+# ============================================================================
+
 def build_all_sessions(
     *,
-    speech_root: Path,
-    output_root: Path,
-    overwrite: bool,
-    split_seed: int,
-    include_blank_trials: bool,
-    include_diagnostic_trials: bool = False,
+    source_root: Path = DEFAULT_SOURCE_ROOT,
+    output_root: Path = DEFAULT_OUTPUT_ROOT,
+    overwrite: bool = False,
+    subject: str = "sub-01",
+    only_session: Optional[str] = None,
+    fail_fast: bool = False,
 ) -> List[Dict[str, object]]:
-    results = []
-    sessions = discover_chinese_sessions(speech_root)
-    stats_by_date = compute_normalization_stats_by_date(
-        sessions,
-        include_blank_trials=include_blank_trials,
-        include_diagnostic_trials=include_diagnostic_trials,
-    )
-    for session in sessions:
-        task_trials = load_task_trials(session.csv_path)
-        if not any(
-            _is_included_trial(
-                trial,
-                include_blank_trials=include_blank_trials,
-                include_diagnostic_trials=include_diagnostic_trials,
-            )
-            for trial in task_trials
-        ):
-            continue
-        builder = ChineseSpeechBuilder(
-            session_dir=session.session_dir,
-            output_root=output_root,
-            split_seed=split_seed,
-            include_blank_trials=include_blank_trials,
-            include_diagnostic_trials=include_diagnostic_trials,
-            normalization_stats=stats_by_date.get(session.session_name[:10]),
-            overwrite=overwrite,
+    sessions = discover_matlab_sessions(source_root)
+
+    if only_session is not None:
+        sessions = [
+            session
+            for session in sessions
+            if session.raw_name == only_session
+            or session.output_name == only_session
+        ]
+
+    if not sessions:
+        print(
+            f"[done] no convertible sessions found under {source_root}"
         )
-        results.append(builder.build())
+        return []
+
+    Path(output_root).mkdir(
+        parents=True, exist_ok=True
+    )
+
+    results: List[Dict[str, object]] = []
+    failures: List[Tuple[str, str]] = []
+
+    for session in sessions:
+        available = ", ".join(
+            f"data_{split}.mat"
+            for split in EXPECTED_SPLITS
+            if split in session.mat_paths
+        )
+
+        print(
+            f"\n=== {session.raw_name} -> "
+            f"{session.output_name} ==="
+        )
+        print(
+            f"source: {session.session_dir}"
+        )
+        print(
+            f"MAT: {available}"
+        )
+
+        try:
+            result = ChineseSpeechBuilder(
+                session=session,
+                output_root=output_root,
+                subject=subject,
+                overwrite=overwrite,
+            ).build()
+
+            if result is None:
+                continue
+
+            counts = result["split_counts"]
+            print(
+                f"[ok] {session.raw_name} -> "
+                f"{session.output_name} "
+                f"(train={counts['train']}, "
+                f"val={counts['val']}, "
+                f"test={counts['test']})"
+            )
+            results.append(result)
+
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            failures.append(
+                (session.raw_name, message)
+            )
+            print(
+                f"[error] {session.raw_name}: "
+                f"{message}"
+            )
+            if fail_fast:
+                raise
+
+    print("\n=== Batch summary ===")
+    print(
+        f"converted={len(results)} "
+        f"failed={len(failures)}"
+    )
+
+    if failures:
+        for raw_name, message in failures:
+            print(
+                f"  FAILED {raw_name}: {message}"
+            )
+
     return results
 
 
-def default_output_root(project_root: Path | None = None) -> Path:
-    if project_root is None:
-        project_root = Path(__file__).resolve().parents[1]
-    return Path(project_root) / "data" / "hdf5_chinese"
-
+# ============================================================================
+# CLI
+# ============================================================================
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parents[1]
-    default_speech_root = project_root.parent / "sub-01" / "speech"
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert MATLAB sentence preprocessing outputs under the "
+            "Windows D: drive (mounted in WSL as /mnt/d) into the Mandarin "
+            "training HDF5 layout."
+        )
+    )
 
-    parser = argparse.ArgumentParser(description="Build Mandarin syllable/tone HDF5 data.")
-    parser.add_argument("--speech-root", type=Path, default=default_speech_root)
-    parser.add_argument("--output-root", type=Path, default=default_output_root(project_root))
-    parser.add_argument("--session", type=str, default=None, help="Optional single session folder name.")
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--include-blank-trials", action="store_true")
-    parser.add_argument("--include-diagnostic-trials", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=DEFAULT_SOURCE_ROOT,
+        help=(
+            "Source root containing YYYYMMDD-HHMMSS folders. "
+            "Default: /mnt/d/wwl/data/self_mat/chinese_hdf5_self"
+        ),
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=(
+            "WSL output root. "
+            "Default: /home/speech/nejm-brain-to-text-cn/data/hdf5_chinese"
+        ),
+    )
+    parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help=(
+            "Optional single raw folder name (e.g. 20260824-143620) "
+            "or output folder name."
+        ),
+    )
+    parser.add_argument(
+        "--subject",
+        type=str,
+        default="sub-01",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Rebuild output folders that already exist. "
+            "Without this flag, existing t15... folders are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Only show discovered sessions, S2/S4 assignments, "
+            "MAT availability, and intended output paths."
+        ),
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help=(
+            "Stop immediately on the first conversion error. "
+            "Default behavior logs the error and continues to later sessions."
+        ),
+    )
+
     args = parser.parse_args()
 
-    all_sessions = discover_chinese_sessions(args.speech_root)
-    sessions = all_sessions
+    sessions = discover_matlab_sessions(
+        args.source_root
+    )
+
     if args.session is not None:
-        sessions = [session for session in sessions if session.session_name == args.session]
-    if not sessions:
-        raise SystemExit(f"No matching Chinese speech sessions found under {args.speech_root}")
+        sessions = [
+            session
+            for session in sessions
+            if session.raw_name == args.session
+            or session.output_name == args.session
+        ]
 
     if args.dry_run:
-        for session in sessions:
-            trials = load_task_trials(session.csv_path)
-            n_speech = sum(1 for trial in trials if trial.condition == "speech")
-            n_diagnostic = sum(1 for trial in trials if _is_diagnostic_trial(trial))
-            n_included = sum(
-                1
-                for trial in trials
-                if _is_included_trial(
-                    trial,
-                    include_blank_trials=args.include_blank_trials,
-                    include_diagnostic_trials=args.include_diagnostic_trials,
-                )
-            )
+        if not sessions:
             print(
-                f"{session.session_name}: trials={len(trials)} speech={n_speech} "
-                f"sentence={n_speech-n_diagnostic} diagnostic={n_diagnostic} "
-                f"blank={len(trials)-n_speech} included={n_included}"
+                f"No convertible sessions found under "
+                f"{args.source_root}"
+            )
+            return
+
+        print(
+            f"source_root = {args.source_root}"
+        )
+        print(
+            f"output_root = {args.output_root}"
+        )
+
+        for session in sessions:
+            mats = ", ".join(
+                f"data_{split}.mat"
+                for split in EXPECTED_SPLITS
+                if split in session.mat_paths
+            )
+            output_dir = (
+                args.output_root
+                / session.output_name
+            )
+            status = (
+                "exists -> skip unless --overwrite"
+                if output_dir.exists()
+                else "new"
+            )
+
+            print(
+                f"{session.raw_name} -> "
+                f"{session.session_code} -> "
+                f"{session.output_name} | "
+                f"MAT=[{mats}] | {status}"
             )
         return
 
-    args.output_root.mkdir(parents=True, exist_ok=True)
-    stats_by_date = compute_normalization_stats_by_date(
-        all_sessions,
-        include_blank_trials=args.include_blank_trials,
-        include_diagnostic_trials=args.include_diagnostic_trials,
+    build_all_sessions(
+        source_root=args.source_root,
+        output_root=args.output_root,
+        overwrite=args.overwrite,
+        subject=args.subject,
+        only_session=args.session,
+        fail_fast=args.fail_fast,
     )
-    for session in sessions:
-        task_trials = load_task_trials(session.csv_path)
-        if not any(
-            _is_included_trial(
-                trial,
-                include_blank_trials=args.include_blank_trials,
-                include_diagnostic_trials=args.include_diagnostic_trials,
-            )
-            for trial in task_trials
-        ):
-            print(f"[skip] {session.session_name} has no included sentence trials")
-            continue
-        result = ChineseSpeechBuilder(
-            session_dir=session.session_dir,
-            output_root=args.output_root,
-            split_seed=args.seed,
-            include_blank_trials=args.include_blank_trials,
-            include_diagnostic_trials=args.include_diagnostic_trials,
-            normalization_stats=stats_by_date.get(session.session_name[:10]),
-            overwrite=args.overwrite,
-        ).build()
-        counts = result["split_counts"]
-        print(
-            f"[ok] {result['session']} -> {result['output_session']} "
-            f"(train={counts['train']}, val={counts['val']}, test={counts['test']})"
-        )
 
 
 if __name__ == "__main__":
