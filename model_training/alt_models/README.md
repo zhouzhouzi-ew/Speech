@@ -65,6 +65,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
 | `tests/test_trim_silence.py` | 16 tests: keep-planning, adaptive VAD, real-data speech retention, session-stamp invariant. |
+| `session_metadata/` | ready-made `metadata.json` for sessions MATLAB wrote none for. |
 | `tests/test_install_matlab_session.py` | 6 tests: metadata resolution and its diagnostics, attr rewrite, real-split install with no vocabulary on the box. |
 | `tests/test_make_all_day_config.py` | 5 tests: duplicate-recording detection, and that it does not fire on two real days. |
 
@@ -198,6 +199,21 @@ training. `trim_silence.py` refuses to propagate that: it stamps its output with
 the name of the directory it is writing into and warns when the source disagrees,
 so a trimmed root is always self-consistent. `audit_hdf5.py` reports the raw
 mismatch as one problem per trial, which is what a stale source looks like.
+
+**`session_metadata/`** holds a ready-made `metadata.json` for sessions the
+MATLAB writer emitted none for, so the file can be copied in directly instead of
+re-running the installer:
+
+```bash
+cp alt_models/session_metadata/t15.2026.08.14.15-05-37_tc_sbp_512.json \
+   ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512/metadata.json
+```
+
+The `roll_stats` in it are computed from the committed cut plan, using the same
+arithmetic that reproduces day 1's `metadata.json` byte-for-byte, rather than
+copied from day 1. `multi_segment_trials` and `max_trial_ptp_gap_ms` are not
+derivable from a cut plan and were dropped rather than guessed — nothing reads
+them.
 `install_matlab_session.py` closes both gaps, then runs `audit_hdf5.py` on the
 result and exits non-zero if it is not clean:
 
