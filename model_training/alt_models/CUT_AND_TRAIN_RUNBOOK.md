@@ -240,6 +240,8 @@ before concluding the model is bad — see the note in `README.md`.
 | trim prints `REFUSED` / exits 1 | the plan does not line up with that session's frame counts — the numbers above will say by how much |
 | `check_config.py` fails | a session dir is missing `data_train.hdf5`, or `dataset_probability_val` is the wrong length |
 | `make_all_day_config.py` refuses | a `name` / `name_trim` pair sits in the same root; point `--dataset_dir` at one or the other |
+| `make_all_day_config.py` says a session "is not usable as a day" | that directory's trials are stamped with a different name, or carry no `session` attribute at all — a leftover build. It is still enumerable, so it would shift every later day index. Point `--dataset_dir` at `hdf5_data_512_trim`, not the raw root |
+| `--dataset_dir ../data/hdf5_data_512` reports 3 days | the stale `t15.2026.08.14.14-45-44_tc_sbp_512` is sitting in there; use the `_trim` root |
 | train reports a PER for the wrong day count | the `sessions:` list — regenerate it, do not hand-edit |
 
 ## Cleanup between LM runs

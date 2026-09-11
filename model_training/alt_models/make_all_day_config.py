@@ -36,6 +36,55 @@ def discover_sessions(dataset_dir: Path) -> list:
     return sessions
 
 
+def check_session_attrs(dataset_dir: Path, sessions: list) -> None:
+    """Refuse a directory whose trials are not stamped with its own name.
+
+    This is the same three-string invariant `audit_hdf5.py` enforces, checked
+    here because a stale session is otherwise *enumerable*: it has a
+    `data_train.hdf5`, so it becomes a day. A directory left over from an older
+    build sits in the sorted order and shifts every day index after it -- and
+    `sessions[i]` is the day layer, so the config silently means something else.
+
+    An absent attribute is the worse case: MATLAB-written sessions that never
+    went through `install_matlab_session.py` have none at all, so nothing
+    downstream can match them to a config entry.
+    """
+    broken = []
+    for name in sessions:
+        path = dataset_dir / name / "data_train.hdf5"
+        try:
+            with h5py.File(path, "r") as f:
+                keys = list(f.keys())
+                if not keys:
+                    broken.append((name, "no trials"))
+                    continue
+                value = f[keys[0]].attrs.get("session")
+        except Exception as exc:  # noqa: BLE001
+            broken.append((name, f"unreadable ({type(exc).__name__}: {exc})"))
+            continue
+        if value is None:
+            broken.append((name, "trials carry no `session` attribute"))
+        else:
+            text = (value.decode("utf-8")
+                    if isinstance(value, (bytes, bytearray)) else str(value))
+            if text != name:
+                broken.append((name, f"trials are stamped {text!r}"))
+
+    if not broken:
+        return
+
+    print(f"\n{dataset_dir} holds session(s) that are not usable as a day:\n",
+          file=sys.stderr)
+    for name, why in broken:
+        print(f"  {name}\n    {why}", file=sys.stderr)
+    print(
+        "\nEach would still be enumerated, and the day indices after it would "
+        "shift.\nRun `python alt_models/audit_hdf5.py --dataset_dir <dir>` for the "
+        "full list, or point --dataset_dir at a root that only holds the sessions "
+        "you mean to train on.", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def recording_fingerprint(session_dir: Path):
     """`{(global_id, n_time_steps), ...}` for a session's train split.
 
@@ -217,6 +266,7 @@ def main() -> None:
     if not sessions:
         print(f"No session directories with data_train.hdf5 under {dataset_dir}", file=sys.stderr)
         raise SystemExit(1)
+    check_session_attrs(dataset_dir, sessions)
     check_for_trim_duplicates(dataset_dir, sessions)
     check_for_duplicate_recordings(dataset_dir, sessions)
 

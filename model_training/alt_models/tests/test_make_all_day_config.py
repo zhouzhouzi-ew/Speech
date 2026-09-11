@@ -38,21 +38,29 @@ import h5py  # noqa: E402
 from make_all_day_config import (  # noqa: E402
     check_for_duplicate_recordings,
     check_for_trim_duplicates,
+    check_session_attrs,
     discover_sessions,
     recording_fingerprint,
 )
 
 
-def _session(root: Path, name: str, lengths: list) -> Path:
-    """A minimal train split whose trials are `(global_id=i, n_time_steps=L)`."""
+def _session(root: Path, name: str, lengths: list, stamp: str | None = "") -> Path:
+    """A minimal train split whose trials are `(global_id=i, n_time_steps=L)`.
+
+    `stamp` is the per-trial `session` attribute; `""` means "stamp it with the
+    directory name" and `None` means "write no attribute at all".
+    """
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
+    value = name if stamp == "" else stamp
     with h5py.File(d / "data_train.hdf5", "w") as f:
         for i, n in enumerate(lengths):
             g = f.create_group(f"trial_{i:04d}")
             g.create_dataset("input_features", data=np.zeros((n, 4), np.float32))
             g.attrs["global_id"] = np.int32(i)
             g.attrs["n_time_steps"] = np.int32(n)
+            if value is not None:
+                g.attrs["session"] = value
     return d
 
 
@@ -129,6 +137,49 @@ def test_the_trim_pair_is_still_caught_by_its_own_more_specific_message():
         message = _expect_refusal(check_for_trim_duplicates, root,
                                   discover_sessions(root))
         assert "trimmed session next to its untrimmed original" in message
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_session_with_no_session_attribute_is_refused():
+    """The 14-45-44 signature: enumerable, so it silently becomes a day.
+
+    It has a `data_train.hdf5`, so `discover_sessions` finds it. Sitting between
+    two good sessions in sorted order it shifts every later day index, and
+    `sessions[i]` is the day layer.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="days_"))
+    try:
+        root = tmp / "hdf5_data_512"
+        _session(root, "day_a", [10, 20])
+        _session(root, "day_b", [30, 40], stamp=None)      # no attr at all
+        message = _expect_refusal(check_session_attrs, root, discover_sessions(root))
+        assert "day_b" in message and "no `session` attribute" in message
+        assert "day_a" not in message, "a healthy session must not be listed"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_session_stamped_with_a_stale_name_is_refused():
+    """The hand-renamed case: directory says one thing, trials say another."""
+    tmp = Path(tempfile.mkdtemp(prefix="days_"))
+    try:
+        root = tmp / "hdf5_data_512"
+        _session(root, "day_a", [10, 20])
+        _session(root, "day_b", [30, 40], stamp="day_b_prevblockcal")
+        message = _expect_refusal(check_session_attrs, root, discover_sessions(root))
+        assert "day_b" in message and "day_b_prevblockcal" in message
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_matching_sessions_pass_the_attr_check():
+    tmp = Path(tempfile.mkdtemp(prefix="days_"))
+    try:
+        root = tmp / "hdf5_data_512"
+        _session(root, "day_a", [10, 20])
+        _session(root, "day_b", [30, 40])
+        check_session_attrs(root, discover_sessions(root))   # must not raise
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
