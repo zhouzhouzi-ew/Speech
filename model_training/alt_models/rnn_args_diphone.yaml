@@ -16,6 +16,17 @@ model:
   patch_size: 14
   patch_stride: 4
 
+  # Architecture selection. Read by alt_models/registry.py, and written into the
+  # checkpoint's args.yaml, so evaluation recovers the right class by itself.
+  diphone_targets: true # predict phoneme transitions instead of phonemes
+  day_calibration: baseline # baseline | hammer_scalpel
+                            # hammer_scalpel adds a FiLM branch + learned per-day
+                            # gate on top of the day affine. It starts out
+                            # functionally identical to the baseline, but is only
+                            # worth switching on with MORE THAN ONE day in
+                            # `dataset.sessions` -- with a single day there is
+                            # nothing to calibrate between.
+
   input_network:
     n_input_layers: 1
     input_layer_sizes:

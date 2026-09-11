@@ -73,7 +73,21 @@ def main() -> None:
         "--output_dir",
         type=str,
         default=None,
-        help="Override output_dir/checkpoint_dir in the generated config.",
+        help=(
+            "Override output_dir/checkpoint_dir in the generated config. "
+            "Defaults to the base config's output_dir with the day count appended."
+        ),
+    )
+    parser.add_argument(
+        "--day_calibration",
+        type=str,
+        default=None,
+        choices=("baseline", "hammer_scalpel"),
+        help=(
+            "Set model.day_calibration in the generated config. `hammer_scalpel` "
+            "is the FiLM + learned-gate day layer; it is only meaningful with more "
+            "than one day. Defaults to whatever the base config already says."
+        ),
     )
     args = parser.parse_args()
 
@@ -89,11 +103,22 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config)
     cfg.dataset.sessions = sessions
+    # 1 == "validate on this day" (see rnn_trainer.validation). Every day is worth
+    # reporting on; the train/val trial split itself comes from test_percentage.
     cfg.dataset.dataset_probability_val = [1] * len(sessions)
 
+    if args.day_calibration:
+        cfg.model.day_calibration = args.day_calibration
+
+    # A multi-day run must not write into the single-day run's output_dir, or the
+    # two checkpoints overwrite each other and args.yaml stops describing the
+    # weights sitting next to it.
+    base_output_dir = str(cfg.output_dir)
     if args.output_dir:
         cfg.output_dir = args.output_dir
-        cfg.checkpoint_dir = f"{args.output_dir}/checkpoint"
+    elif len(sessions) > 1 and not base_output_dir.endswith(f"_{len(sessions)}day"):
+        cfg.output_dir = f"{base_output_dir}_{len(sessions)}day"
+    cfg.checkpoint_dir = f"{cfg.output_dir}/checkpoint"
 
     print(f"Found {len(sessions)} day(s) under {dataset_dir}:")
     for idx, session in enumerate(sessions):

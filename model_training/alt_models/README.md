@@ -50,12 +50,33 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 |---|---|
 | `diphone.py` | encoding + marginalisation. Pure functions, no state. |
 | `diphone_model.py` | `DiphoneGRUDecoder(GRUDecoder)` — derived head width, marginalised `forward`. |
+| `day_calibration.py` | `DayCalibratedGRUDecoder(GRUDecoder)` — hammer + scalpel day layer (see below). |
+| `registry.py` | `resolve_model_class(config)` — the 2×2 diphone × day-calibration dispatch. |
 | `diphone_trainer.py` | `DiphoneTrainer(BrainToTextDecoder_Trainer)` — swap the model class, swap the targets. |
 | `train_diphone.py` / `evaluate_diphone.py` | entry points, siblings of `train_model.py` / `evaluate_model.py`. |
 | `rnn_args_diphone.yaml` | config (English 512D, copy task). |
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
+| `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
+
+Two config keys in the `model:` block select among four model classes:
+
+```yaml
+model:
+  diphone_targets: true        # default true   — this package is diphone-first
+  day_calibration: baseline    # baseline | hammer_scalpel
+```
+
+| `diphone_targets` | `day_calibration` | class |
+|---|---|---|
+| `false` | `baseline` | `rnn_model.GRUDecoder` (the original) |
+| `true` | `baseline` | `DiphoneGRUDecoder` |
+| `false` | `hammer_scalpel` | `DayCalibratedGRUDecoder` |
+| `true` | `hammer_scalpel` | `DiphoneDayCalibratedGRUDecoder` |
+
+Both knobs are written into the checkpoint's `args.yaml`, so
+`evaluate_diphone.py` picks the right class back up with no `--arch` flag.
 
 ### `DiphoneGRUDecoder` keeps two contracts that the rest of the repo relies on
 
@@ -99,13 +120,22 @@ cd Speech/model_training
 python alt_models/make_all_day_config.py \
     --dataset_dir ../data/hdf5_data_512 \
     --output alt_models/rnn_args_diphone_alldays.yaml \
-    --output_dir trained_models/diphone_rnn_alldays
+    --day_calibration hammer_scalpel
 
 python alt_models/train_diphone.py alt_models/rnn_args_diphone_alldays.yaml
 ```
 
 Day order matters: `sessions[i]` **is** the day index the day-specific input
 layer uses, so regenerate the config rather than hand-editing a trained one.
+The script sorts lexically, which for `<name>.<YYYY>.<MM>.<DD>.<HH-MM-SS>_<sfx>`
+is also chronologically. `dataset_probability_val` gets one `1` per day, meaning
+"validate on this day" — it gates reporting, not the train/val trial split
+(which is `dataset.test_percentage`).
+
+With more than one day, `--output_dir` defaults to the base `output_dir` suffixed
+with the day count (`..._512_2day`), so a multi-day run can't overwrite a
+single-day checkpoint sitting at the same path. Pass `--output_dir` explicitly
+to override.
 
 > Multi-day training needs `data_train.hdf5` under `dataset_dir` for every day.
 > Those come out of the MATLAB 512 pipeline
@@ -139,6 +169,53 @@ logit scale) may want a small retune. Neural metrics need no adjustment.
 
 ---
 
+## Day calibration (`hammer_scalpel`)
+
+After **NHS** (Olak et al., ICLR 2026). The baseline day layer already gives each
+day its own affine input map `X_h = X W_d + 1 b_dᵀ` — the paper's *hammer*. It
+adds a second, multiplicative branch, the *scalpel*:
+
+```
+X_s = X ⊙ γ_d + β_d                  # FiLM
+g_d = σ(w_gᵀ e_d)                    # learned per-day gate
+X   = g_d · X_s + (1 - g_d) · X_h
+```
+
+so a day can be corrected by a full affine map, by a cheap diagonal + shift, or
+by any mix the data chooses.
+
+**It starts as an exact no-op.** With `W_d = I`, `b_d = 0`, `γ_d = 1`, `β_d = 0`
+both branches equal `X`, and `σ(0) = 0.5` splits between two identical things —
+so at step 0 the model computes `softsign(X)`, byte-identical to the baseline.
+It can only diverge if the data pulls it there. `test_identity_at_init` and
+`test_gate_closed_reproduces_the_baseline_and_open_does_not` pin both halves of
+that claim; `test_identity_at_init_for_the_diphone_variant` pins it one level up,
+where the head is 1157-wide and a state-dict comparison isn't possible.
+
+**Only worth enabling with more than one day.** With a single session there is
+nothing to calibrate *between*, and the gate has nothing to learn. That is why
+the shipping config defaults to `baseline`.
+
+**Optimizer contract.** Every new parameter is named `day_*` (`day_scales.i`,
+`day_offsets.i`, `day_gate_logits`), so `rnn_trainer.create_optimizer` puts them
+in the day-layer group and they get `lr_max_day` / `weight_decay_day` rather than
+the general LR. Baseline parameter names are untouched — the calibrator only
+*adds* names. Both pinned by `test_every_new_parameter_is_in_the_day_param_group`
+and `test_baseline_parameter_names_are_unchanged`.
+
+Enabling it:
+
+```bash
+python alt_models/make_all_day_config.py \
+    --dataset_dir ../data/hdf5_data_512 \
+    --output alt_models/rnn_args_diphone_alldays.yaml \
+    --day_calibration hammer_scalpel
+```
+
+or set `model.day_calibration: hammer_scalpel` by hand.
+
+---
+
 ## Known pre-existing bug this folder works around
 
 `evaluate_model_helpers.py:186` does `int(g.attrs['paired_diagnostic_block_num'])`.
@@ -168,11 +245,19 @@ edit touches a shared file, so it was left out of this folder on purpose.
 
 ```bash
 cd Speech/model_training
-python alt_models/tests/test_diphone.py          # or: python -m pytest alt_models/tests -v
+python alt_models/tests/test_diphone.py          # 22 tests
+python alt_models/tests/test_day_calibration.py  # 12 tests
+# or: python -m pytest alt_models/tests -v
 ```
 
-Covers the encoding (against a scalar reference implementation), the
-marginalisation (against a materialised brute-force computation, plus row sums
-and differentiability), the model contracts (shapes, parameter names, param-group
-split, day-layer identity init, gradients reaching the day layer through a real
-CTC loss), and CTC feasibility on all 153 real training trials.
+`test_diphone.py` covers the encoding (against a scalar reference
+implementation), the marginalisation (against a materialised brute-force
+computation, plus row sums and differentiability), the model contracts (shapes,
+parameter names, param-group split, day-layer identity init, gradients reaching
+the day layer through a real CTC loss), and CTC feasibility on all 153 real
+training trials.
+
+`test_day_calibration.py` covers identity-at-init for both the monophone and
+diphone variants, that the gate actually modulates (closed → baseline, open with
+`γ=2` → not baseline), that gradients reach all three new parameter sets, the
+optimizer param-group contract, and all four registry combinations.

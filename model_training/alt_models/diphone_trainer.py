@@ -41,8 +41,9 @@ if str(_PARENT) not in sys.path:
 import rnn_trainer  # noqa: E402  (needs the sys.path tweak above)
 from rnn_trainer import BrainToTextDecoder_Trainer  # noqa: E402
 
-from diphone import batch_phonemes_to_diphones, n_symbols_for  # noqa: E402
-from diphone_model import DiphoneGRUDecoder  # noqa: E402
+from diphone import batch_phonemes_to_diphones  # noqa: E402
+from diphone_model import _DiphoneHeadMixin  # noqa: E402
+from registry import describe_model_class, resolve_model_class  # noqa: E402
 
 
 @contextmanager
@@ -78,21 +79,19 @@ class DiphoneTrainer(BrainToTextDecoder_Trainer):
 
     def __init__(self, args):
         options = resolve_diphone_options(args)
+        model_cls = resolve_model_class(args)
 
-        with _gru_class_swapped(DiphoneGRUDecoder):
+        with _gru_class_swapped(model_cls):
             super().__init__(args)
 
-        if not isinstance(self.model, DiphoneGRUDecoder):
-            # torch.compile wraps the module, so unwrap before the type check.
-            inner = getattr(self.model, "_orig_mod", self.model)
-            if not isinstance(inner, DiphoneGRUDecoder):
-                raise TypeError(
-                    "DiphoneTrainer expected a DiphoneGRUDecoder but the trainer built "
-                    f"{type(inner).__name__}. Check that `alt_models` is importable and "
-                    "that nothing else rebinds rnn_trainer.GRUDecoder."
-                )
-
+        # torch.compile wraps the module, so unwrap before inspecting it.
         inner = getattr(self.model, "_orig_mod", self.model)
+        if not isinstance(inner, _DiphoneHeadMixin):
+            raise TypeError(
+                f"DiphoneTrainer expected a diphone model but the trainer built "
+                f"{type(inner).__name__}. Check `model.diphone_targets` in the config "
+                "and that nothing else rebinds rnn_trainer.GRUDecoder."
+            )
         self.n_symbols = inner.n_symbols
         self.close_with_sil = options["close_with_sil"]
         # `<sil>` is the last class in the 35-class English set (id 34), which
@@ -103,11 +102,22 @@ class DiphoneTrainer(BrainToTextDecoder_Trainer):
             else self.n_symbols
         )
 
+        self.logger.info(f"Model class: {describe_model_class(args)}")
         self.logger.info(
             f"Diphone CTC targets: {inner.n_phoneme_classes} phoneme classes -> "
             f"{inner.n_diphone_classes} diphone classes "
             f"(n_symbols={inner.n_symbols}, close_with_sil={self.close_with_sil})"
         )
+        if getattr(inner, "day_gate_logits", None) is not None:
+            self.logger.info(
+                "Day calibration: hammer + scalpel with a learned per-day gate "
+                f"over {inner.n_days} day(s)"
+            )
+        elif inner.n_days == 1:
+            self.logger.info(
+                "Day calibration is off and only one day is configured, so the day "
+                "layer has nothing to calibrate. See make_all_day_config.py."
+            )
 
     # ------------------------------------------------------------------
     def to_diphone_targets(self, labels, phone_seq_lens):
