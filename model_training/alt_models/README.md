@@ -64,7 +64,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
-| `tests/test_trim_silence.py` | 14 tests: keep-planning, adaptive VAD, real-data speech retention. |
+| `tests/test_trim_silence.py` | 16 tests: keep-planning, adaptive VAD, real-data speech retention, session-stamp invariant. |
 
 Two config keys in the `model:` block select among four model classes:
 
@@ -188,6 +188,14 @@ load-bearing and they are not the same string:
 
 Three strings have to agree exactly — directory, config entry, attribute.
 MATLAB guarantees only the third, and it emits no `metadata.json` either.
+
+Renaming a session directory by hand breaks only the third: the config fixes
+itself (`make_all_day_config.py` enumerates directories), but the attribute keeps
+whatever MATLAB stamped, and `sessions.index(session)` is what notices — after
+training. `trim_silence.py` refuses to propagate that: it stamps its output with
+the name of the directory it is writing into and warns when the source disagrees,
+so a trimmed root is always self-consistent. `audit_hdf5.py` reports the raw
+mismatch as one problem per trial, which is what a stale source looks like.
 `install_matlab_session.py` closes both gaps, then runs `audit_hdf5.py` on the
 result and exits non-zero if it is not clean:
 

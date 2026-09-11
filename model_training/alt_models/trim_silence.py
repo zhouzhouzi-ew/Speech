@@ -259,6 +259,29 @@ def build_plan(audio, fs, hop, mic_start, trials, args) -> dict:
     }, report
 
 
+def read_session_attr(session_dir: Path):
+    """The name stamped on the source trials, read from the first group we see.
+
+    `session` has to equal the directory name: `evaluate_model_extended.py:199`
+    does `sessions.index(session)` on the per-trial attribute, while `rnn_trainer`
+    builds `<dataset_dir>/<config entry>/data_train.hdf5` from the directory. A
+    MATLAB output renamed by hand keeps the stamp it was written with, so the two
+    silently diverge and only surface at evaluation time.
+    """
+    for split in SPLITS:
+        path = session_dir / f"data_{split}.hdf5"
+        if not path.exists():
+            continue
+        with h5py.File(path, "r") as f:
+            for key in f.keys():
+                value = f[key].attrs.get("session")
+                if value is not None:
+                    if isinstance(value, (bytes, bytearray)):
+                        return value.decode("utf-8")
+                    return str(value)
+    return None
+
+
 def load_plan(path: Path) -> dict:
     plan = json.loads(Path(path).read_text(encoding="utf-8"))
     if "trials" not in plan:
@@ -430,7 +453,20 @@ def main() -> int:
     else:
         root = session_dir.parent
         out_dir = root.with_name(root.name + "_trim") / session_dir.name
-    session_name = out_dir.name if out_dir.name != session_dir.name else None
+
+    # The output directory name IS the session name -- always stamp the trials to
+    # match it, whatever the source said. Otherwise a hand-renamed MATLAB folder
+    # produces a trimmed session that only fails later, at `sessions.index()`.
+    session_name = out_dir.name
+    stamped = read_session_attr(session_dir)
+    if stamped is not None and stamped != session_name:
+        print(f"\nWARNING: the source trials are stamped session={stamped!r} but "
+              f"this session is {session_name!r}.\n"
+              f"         The OUTPUT will be stamped {session_name!r} to match its "
+              "directory.\n"
+              "         The source still disagrees -- run install_matlab_session.py "
+              "on it\n"
+              "         so the config that points at the source stays usable.")
 
     print(f"\nsession : {session_dir.name}")
     print(f"output  : {'(dry run)' if args.dry_run else out_dir}")

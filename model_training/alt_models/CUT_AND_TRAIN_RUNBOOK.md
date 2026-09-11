@@ -57,6 +57,34 @@ cd ~/nejm-brain-to-text-en/model_training
 ls -d ../data/hdf5_data_512/*15-05-37*
 ```
 
+### If you renamed the session directory by hand
+
+Renaming the folder fixes the config, because `make_all_day_config.py` enumerates
+from directory names — but it does **not** touch the per-trial `session`
+attribute MATLAB wrote. `evaluate_model_extended.py:199` does
+`sessions.index(session)` on that attribute, so a renamed-but-stale session
+audits with 189 problems (`session attr '…_prevblockcal' != directory name '…'`)
+and fails at evaluation, after training.
+
+Two ways out; either is fine.
+
+**Preferred — reinstall with the new name.** The original MATLAB output is still
+on disk and the installer rebuilds the session from it:
+
+```bash
+python alt_models/install_matlab_session.py \
+    --source-dir /mnt/d/wwl/data/self_mat/hdf5_data_512/20260814-144544 \
+    --dataset-dir ../data/hdf5_data_512 \
+    --metadata-from ../data/hdf5_data_512/t15.2026.08.14.10-11-24_tc_sbp_512 \
+    --session-name t15.2026.08.14.15-05-37_tc_sbp_512 \
+    --overwrite
+```
+
+**Or just proceed to step 3.** The trimmer stamps its output with the name of
+the directory it writes into, so `hdf5_data_512_trim/` is clean whichever way
+you got there — training and evaluation read only that root. The stale source is
+then harmless; it only shows up if you audit the raw `hdf5_data_512/`.
+
 ## 3. Trim both days
 
 The plans are replayed, not recomputed — no audio required. Each trial's frame

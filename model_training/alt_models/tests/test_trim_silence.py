@@ -268,6 +268,106 @@ def test_real_trimming_removes_no_speech():
 
 
 # ---------------------------------------------------------------------------
+# the three-string invariant
+# ---------------------------------------------------------------------------
+def test_a_trimmed_session_is_stamped_to_match_its_directory():
+    """A hand-renamed source must not produce a hand-renamed-but-stale output.
+
+    The MATLAB writer names the session after the task (`..._prevblockcal`) and
+    the directory after the recording; renaming the directory by hand fixes the
+    config but leaves every trial's `session` attribute stale. Trimming then
+    copies that attribute straight through, so the output looks fine and only
+    blows up at `evaluate_model_extended.py:199`. The trimmer has to stamp the
+    output with the name of the directory it is writing into.
+    """
+    import h5py
+    import json as _json
+    import shutil
+    import tempfile
+
+    from trim_silence import main as trim_main
+
+    stale = "t15.2026.08.14.15-05-37_tc_sbp_512_prevblockcal"
+    name = "t15.2026.08.14.15-05-37_tc_sbp_512"
+    tmp = Path(tempfile.mkdtemp(prefix="trim_session_"))
+    try:
+        src = tmp / "hdf5_data_512" / name
+        src.mkdir(parents=True)
+        plan_trials = {}
+        for split, n_trials in (("train", 2), ("val", 1)):
+            with h5py.File(src / f"data_{split}.hdf5", "w") as f:
+                for i in range(n_trials):
+                    gid = len(plan_trials)
+                    n_bins = 30
+                    g = f.create_group(f"trial_{i:03d}")
+                    g.create_dataset("input_features",
+                                     data=np.zeros((n_bins, 4), dtype=np.float32))
+                    g.create_dataset("seq_class_ids",
+                                     data=np.zeros(5, dtype=np.int64))
+                    g.attrs["global_id"] = np.int32(gid)
+                    g.attrs["session"] = stale
+                    g.attrs["n_time_steps"] = np.int32(n_bins)
+                    # An empty cut keeps every trial in range, so the only thing
+                    # under test here is the stamp -- refusals would mask it.
+                    plan_trials[str(gid)] = {"n_bins": n_bins, "cut": []}
+        plan_path = tmp / "plan.json"
+        plan_path.write_text(_json.dumps({
+            "source": {"task_csv": "synthetic", "audio": "synthetic"},
+            "params": {"max_silence_ms": 2000.0, "keep_silence_ms": 0.0,
+                       "edge_keep_ms": None, "below_peak_db": 22.0,
+                       "above_floor_db": 20.0, "frame_ms": 20.0},
+            "trials": plan_trials,
+        }), encoding="utf-8")
+
+        argv = sys.argv
+        sys.argv = ["trim_silence.py", "--plan", str(plan_path),
+                    "--session-dir", str(src)]
+        try:
+            assert trim_main() == 0, "a clean plan must not report refusals"
+        finally:
+            sys.argv = argv
+
+        out = tmp / "hdf5_data_512_trim" / name
+        assert out.is_dir(), f"expected the output at {out}"
+        for split in ("train", "val"):
+            with h5py.File(out / f"data_{split}.hdf5", "r") as f:
+                for key in f.keys():
+                    assert f[key].attrs["session"] == name, (
+                        f"{split}/{key}: output stamped "
+                        f"{f[key].attrs['session']!r}, directory is {name!r}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_read_session_attr_reports_the_source_stamp():
+    """The warning above is only useful if the source stamp is read correctly."""
+    import h5py
+    import shutil
+    import tempfile
+
+    from trim_silence import read_session_attr
+
+    tmp = Path(tempfile.mkdtemp(prefix="trim_attr_"))
+    try:
+        d = tmp / "some_dir"
+        d.mkdir()
+        with h5py.File(d / "data_train.hdf5", "w") as f:
+            g = f.create_group("trial_000")
+            g.create_dataset("input_features", data=np.zeros((3, 2), np.float32))
+            g.attrs["session"] = "stamped_on_the_trials"
+        assert read_session_attr(d) == "stamped_on_the_trials"
+
+        empty = tmp / "no_attrs"
+        empty.mkdir()
+        with h5py.File(empty / "data_train.hdf5", "w") as f:
+            g = f.create_group("trial_000")
+            g.create_dataset("input_features", data=np.zeros((3, 2), np.float32))
+        assert read_session_attr(empty) is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 def _run_all():
     tests = [
         (name, obj)
