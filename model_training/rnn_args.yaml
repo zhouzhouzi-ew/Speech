@@ -85,6 +85,5 @@ dataset:
   bad_trials_dict: null # dictionary of bad trials to exclude from the dataset
   sessions: # list of sessions to include in the dataset
   - t15.2026.08.14.10-11-24_tc_sbp_512
-  - t15.2026.08.14.14-45-44_tc_sbp_512
   dataset_probability_val: # probability of including a trial in the validation set (0 or 1)
   - 1
