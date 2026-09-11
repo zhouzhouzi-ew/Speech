@@ -52,6 +52,22 @@ def decode_text_value(value):
             return ''.join(value.tolist())
     return str(value)
 
+def decode_int_value(value):
+    """The numeric half of `decode_text_value`.
+
+    Scalar attributes in these files come back as 1-element arrays --
+    `paired_diagnostic_block_num` is stored as `array([8], dtype=int32)`. numpy 1
+    converted that with a DeprecationWarning, numpy 2 raises
+    `TypeError: only 0-dimensional arrays can be converted to Python scalars`, so
+    `evaluate_model.py` dies on the first trial after an environment upgrade.
+    Taking element 0 is what the caller always meant.
+    """
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return int(value.reshape(-1)[0])
+    return int(value)
+
 
 def load_session_phoneme_order(metadata_path):
     metadata = json.loads(Path(metadata_path).read_text(encoding='utf-8'))
@@ -183,7 +199,7 @@ def load_h5py_file(file_path, b2txt_csv_df):
             session = decode_text_value(g.attrs['session'])
             raw_session = decode_text_value(g.attrs['raw_session']) if 'raw_session' in g.attrs else session
             paired_diagnostic_session = decode_text_value(g.attrs['paired_diagnostic_session']) if 'paired_diagnostic_session' in g.attrs else None
-            paired_diagnostic_block_num = int(g.attrs['paired_diagnostic_block_num']) if 'paired_diagnostic_block_num' in g.attrs else None
+            paired_diagnostic_block_num = decode_int_value(g.attrs['paired_diagnostic_block_num']) if 'paired_diagnostic_block_num' in g.attrs else None
             subject = decode_text_value(g.attrs['subject']) if 'subject' in g.attrs else None
             date = decode_text_value(g.attrs['date']) if 'date' in g.attrs else None
             split = decode_text_value(g.attrs['split']) if 'split' in g.attrs else None

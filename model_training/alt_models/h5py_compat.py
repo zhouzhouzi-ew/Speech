@@ -14,11 +14,12 @@ was a DeprecationWarning in numpy 1.x and is a hard `TypeError` in numpy 2.x
 ("only 0-dimensional arrays can be converted to Python scalars").  Observed on
 numpy 2.4.3 / Python 3.14.
 
-So the evaluation entry point is broken for *every* model produced by the
-MATLAB pipeline, diphone or not.  Rewriting the upstream helper is out of scope
-here (the `model_training/` tree is meant to stay byte-identical), so instead
-this patch teaches `h5py` itself to hand back a scalar whenever an attribute
-holds exactly one element.
+So the evaluation entry point was broken for *every* model produced by the
+MATLAB pipeline, diphone or not.  That specific call site has since been fixed
+in `evaluate_model_helpers.py` (`decode_int_value`), so the original
+`evaluate_model.py` now runs on numpy 2 as well.  This patch is kept because it
+covers the whole class of the bug rather than one attribute: anything else that
+hits a size-1 attribute -- in this repo or upstream -- gets a scalar too.
 
 Semantics: an attribute of size > 1 is returned untouched, so genuine array
 attributes behave exactly as before.  Size-1 attributes become Python scalars,

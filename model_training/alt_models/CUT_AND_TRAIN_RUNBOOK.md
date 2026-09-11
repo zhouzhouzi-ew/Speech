@@ -137,6 +137,15 @@ python alt_models/audit_hdf5.py --dataset_dir ../data/hdf5_data_512_trim
 
 Must print `OK -- 2 session(s) pass the structural + label contract.`
 
+This also checks that each session has a `metadata.json`. That file is what maps
+the model's 35 classes onto the LM's official 41-phoneme order — the session's
+order is not the official one (its id 1 is `AE`, the official id 1 is `AA`), so
+without it the LM reads the wrong phonemes. Confirm both are there:
+
+```bash
+ls -la ../data/hdf5_data_512_trim/*/metadata.json
+```
+
 ## 5. Build the two-day config
 
 ```bash
@@ -158,6 +167,54 @@ init, so it can only help. With two days there is finally something for it to
 calibrate between. Use `--day_calibration baseline` for the A/B.
 
 `output_dir` becomes `trained_models/diphone_rnn_electrode_512_2day`.
+
+### 5b. The baseline (monophone) config, for the A/B
+
+Steps 5–7 produce **diphone numbers only**. Without a baseline on the same two
+trimmed sessions there is nothing to compare them against, so build the
+monophone config the same way:
+
+```bash
+python alt_models/make_all_day_config.py \
+    --dataset_dir ../data/hdf5_data_512_trim \
+    --config alt_models/rnn_args_baseline.yaml \
+    --output alt_models/rnn_args_baseline_2day_trim.yaml
+
+python alt_models/check_config.py alt_models/rnn_args_baseline_2day_trim.yaml
+```
+
+`alt_models/rnn_args_baseline.yaml` is the stock `rnn_args.yaml` plus two
+deliberate changes. The file is separate so `rnn_args.yaml` itself stays
+untouched.
+
+1. `diphone_targets: false`, which has to be explicit: `registry.py` defaults it
+   to **true**, so a config without the key resolves to `DiphoneGRUDecoder` and
+   the checkpoint gets evaluated with the wrong head.
+2. **`num_training_batches: 20000` and the matching decay / val-step values**,
+   where the stock config says 2,000. The two arms have to train for the same
+   number of steps or the comparison measures the schedule as much as the model.
+   The baseline file also sets `batches_per_val_step: 1000`, so both arms report
+   20 val points and the PER curves are directly comparable.
+
+Confirm they line up before starting the run — this prints nothing when they do:
+
+```bash
+python - <<'EOF'
+from omegaconf import OmegaConf
+b = OmegaConf.load("alt_models/rnn_args_baseline_2day_trim.yaml")
+d = OmegaConf.load("alt_models/rnn_args_diphone_2day_trim.yaml")
+# batch_size lives under `dataset:`, the rest at the top level.
+for path in ("num_training_batches", "lr_decay_steps", "lr_decay_steps_day",
+             "batches_per_val_step", "seed", "dataset.batch_size",
+             "dataset.days_per_batch"):
+    get = lambda c: c.get(path, c.dataset.get(path.split(".", 1)[1])
+                          if path.startswith("dataset.") else None)
+    assert get(b) == get(d), f"{path}: baseline={get(b)} diphone={get(d)}"
+print("schedules match")
+EOF
+```
+
+`output_dir` becomes `trained_models/baseline_rnn_512_2day`.
 
 ## 6. Train
 
@@ -221,6 +278,69 @@ Reports `PER`, `WER LM OFF`, `WER LM ON`, word accuracy, and a per-trial markdow
 + JSON + CSV under `<model_path>/eval_outputs/`. `--eval_type val` for the val
 split instead.
 
+## 8. Evaluate the baseline — the numbers to compare against
+
+Same two sessions, same splits, same trimmed data, so the only difference is the
+model. Train it with the **original, unmodified** entry points:
+
+```bash
+python train_model.py alt_models/rnn_args_baseline_2day_trim.yaml
+
+python evaluate_model.py \
+    --model_path trained_models/baseline_rnn_512_2day \
+    --data_dir ../data/hdf5_data_512_trim \
+    --eval_type test \
+    --gpu_number 0 \
+    --skip_lm \
+    --output_prefix baseline_2day_trim
+```
+
+Then the same again without `--skip_lm`, with the LM server from step 7 running.
+
+`train_model.py` and `evaluate_model.py` are the stock ones and stay that way —
+`evaluate_model.py` is a two-line shim over `evaluate_model_extended.main()`.
+
+Two things worth knowing before you run it:
+
+- **`evaluate_model.py` does the same everything else does, but no registry.**
+  It instantiates `rnn_model.GRUDecoder` directly, so it evaluates a baseline
+  checkpoint that has no `diphone_targets` key at all. That is *not* true of
+  `evaluate_diphone.py`, which reads the key from the checkpoint and defaults it
+  to true — so point step 7's script only at diphone checkpoints.
+- **The numpy-2 landmine is fixed, but only as of this commit.** Sizes-1
+  attributes written by MATLAB (`int(array([8]))`) used to raise `TypeError` on
+  numpy 2 and kill `evaluate_model.py` on day 1's first trial. If you pulled
+  before the fix and see that error, pull again. `evaluate_diphone.py` was never
+  affected — it patches `h5py` instead.
+
+For an apples-to-apples A/B, keep `--skip_lm` **off** on both or **on** on both.
+Greedy WER is unaffected by the LM, but the reported `WER LM ON` is a different
+quantity, and the diphone logits carry a `+log(34)` offset that `acoustic_scale`
+and `blank_penalty` were not tuned against (see the caveat in step 7). If the
+diphone model's LM-on WER looks clearly worse than its LM-off WER while PER is
+fine, that is the scale mismatch, not the model.
+
+### What the three arms are
+
+Step 5 builds the diphone config with `--day_calibration hammer_scalpel`, so you
+end up with three readable numbers rather than two:
+
+| arm | how | what it isolates |
+|---|---|---|
+| **baseline** (原始) | `train_model.py` + `evaluate_model.py` on step 5b's config | the published architecture, reproduced on this subject |
+| **diphone** | step 5's config with `--day_calibration baseline` | the effect of predicting phoneme transitions |
+| **diphone + day-cal** | step 5's config as written (`hammer_scalpel`) | what the day layer adds on two days |
+
+Build the middle one by rerunning step 5 with `--day_calibration baseline` and a
+distinct `--output` / `--output_dir` — `make_all_day_config.py` only appends
+`_2day`, so leaving the defaults means it overwrites the `hammer_scalpel`
+checkpoint's config. To compare **only** the diphone change against the original,
+make the middle one and leave the third out; the day layer is a separate question
+and mixing it in makes a worse result impossible to attribute.
+
+All three share `dataset_probability_val`, the trim, and the split, so the
+numbers are comparable line by line in the `eval_outputs/` markdown.
+
 ### One caveat specific to the diphone model
 
 The marginalised diphone logits carry roughly a `+log(34)` offset relative to the
@@ -243,11 +363,13 @@ before concluding the model is bad — see the note in `README.md`.
 | `make_all_day_config.py` says a session "is not usable as a day" | that directory's trials are stamped with a different name, or carry no `session` attribute at all — a leftover build. It is still enumerable, so it would shift every later day index. Point `--dataset_dir` at `hdf5_data_512_trim`, not the raw root |
 | `--dataset_dir ../data/hdf5_data_512` reports 3 days | the stale `t15.2026.08.14.14-45-44_tc_sbp_512` is sitting in there; use the `_trim` root |
 | train reports a PER for the wrong day count | the `sessions:` list — regenerate it, do not hand-edit |
+| `logits last dimension (35) does not match source_order length (41)` in the LM step | a session under `--data_dir` has **no `metadata.json`**, so evaluation fell back to guessing the official 41-class order. Only the LM path needs it, which is why `--skip_lm` works and PER/WER look fine. `ls ../data/hdf5_data_512_trim/*/metadata.json`, then copy the missing one in from `alt_models/session_metadata/` and re-run |
 
 ## Cleanup between LM runs
 
 ```bash
 rm -rf trained_models/diphone_rnn_electrode_512_2day/eval_outputs
+rm -rf trained_models/baseline_rnn_512_2day/eval_outputs
 redis-cli -h localhost -p 6379 shutdown nosave
 ```
 

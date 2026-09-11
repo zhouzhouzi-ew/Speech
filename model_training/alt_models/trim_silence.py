@@ -496,6 +496,27 @@ def main() -> int:
             s = session_dir / name
             if s.exists():
                 shutil.copy2(s, out_dir / name)
+
+        # `metadata.json` is not optional downstream for anything but a 41-class
+        # model: `evaluate_model_extended._load_session_bundle` falls back to the
+        # official 41-class order when it is missing, and a 35-class model then
+        # dies inside the LM path with "logits last dimension (35) does not match
+        # source_order length (41)". Trimming is where the file gets dropped, and
+        # this is the last point at which the source is still on hand, so say so
+        # rather than producing a session that trains fine and cannot be
+        # evaluated.
+        if not (out_dir / "metadata.json").exists():
+            print(f"\nWARNING: {session_dir.name} has no metadata.json to carry over, so "
+                  f"{out_dir.name} has none either.\n"
+                  "         Training will work; evaluation will not (the phoneme order "
+                  "is unknown,\n"
+                  "         and evaluation guesses 41 classes). Install the session "
+                  "properly first --\n"
+                  "         alt_models/install_matlab_session.py writes the vocabulary -- "
+                  "or copy one in:\n"
+                  f"           cp alt_models/session_metadata/{session_name}.json "
+                  f"{out_dir / 'metadata.json'}\n")
+
         meta_path = out_dir / "metadata.json"
         if session_name and meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))

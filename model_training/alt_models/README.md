@@ -55,13 +55,14 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `diphone_trainer.py` | `DiphoneTrainer(BrainToTextDecoder_Trainer)` — swap the model class, swap the targets. |
 | `train_diphone.py` / `evaluate_diphone.py` | entry points, siblings of `train_model.py` / `evaluate_model.py`. |
 | `rnn_args_diphone.yaml` | config (English 512D, copy task). |
+| `rnn_args_baseline.yaml` | the stock `rnn_args.yaml` + `diphone_targets: false`, so the monophone model is the A/B arm. |
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
 | `check_config.py` | pre-flight for the `sessions:` block — catches the silent one-day failure. |
 | `install_matlab_session.py` | installs a MATLAB `data_*.hdf5` folder as a session; reconciles the dir-name/attr split and supplies `metadata.json`. |
 | `trim_silence.py` | drops silent runs longer than 2 s; `--out-plan` / `--plan` make it runnable without the audio. |
 | `cut_plans/` | precomputed cut plans for both 2026-08-14 sessions, keyed by `global_id`. |
 | `CUT_AND_TRAIN_RUNBOOK.md` | end-to-end: pull → install → trim → audit → train → PER/WER. |
-| `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
+| `h5py_compat.py` | belt-and-braces numpy-2 scalar-attribute patch for the eval path (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
 | `tests/test_trim_silence.py` | 16 tests: keep-planning, adaptive VAD, real-data speech retention, session-stamp invariant. |
@@ -200,6 +201,21 @@ the name of the directory it is writing into and warns when the source disagrees
 so a trimmed root is always self-consistent. `audit_hdf5.py` reports the raw
 mismatch as one problem per trial, which is what a stale source looks like.
 
+**`metadata.json` is load-bearing for the LM, not just for labels.** The model
+emits 35 classes in its own order; the WFST LM expects the official 41-phoneme
+order. `expand_logits_to_official_order` reorders and widens one to the other
+(the two orders are genuinely different — the model's id 1 is `AE`, the official
+id 1 is `AA` — and the 6 the model cannot emit, `AO CH JH OY SH ZH`, are filled
+with the log-prob floor). It gets the session's order from that session's
+`metadata.json`. If the file is absent, `_load_session_bundle` has nothing to
+map from and used to fall back to the official order silently, which surfaced
+much later as `logits last dimension (35) does not match source_order length
+(41)`. It now raises at load time naming the session and the fix.
+
+Note that only the LM path needs it: `--skip_lm` and the PER/WER numbers are
+unaffected, so a session with no `metadata.json` trains and scores fine and then
+fails at the last step.
+
 **`session_metadata/`** holds a ready-made `metadata.json` for sessions the
 MATLAB writer emitted none for, so the file can be copied in directly instead of
 re-running the installer:
@@ -336,8 +352,18 @@ MATLAB's own count of trials over 15 s (two: gid 105 and gid 119).
 
 * **`num_training_batches` / `lr_decay_steps`.** The diphone head is 33× wider,
   so it needs more steps than the monophone baseline to reach the same loss.
-  The config ships 20,000 (and matches `lr_decay_steps` to it). If val PER is
-  still falling at the last logged step, raise both.
+  `rnn_args_diphone.yaml` ships 20,000 (and matches both `lr_decay_steps` and
+  `lr_decay_steps_day` to it). If val PER is still falling at the last logged
+  step, raise all three together.
+
+  **The arms have to agree on this.** `rnn_args_baseline.yaml` therefore also
+  ships 20,000 even though the stock `rnn_args.yaml` says 2,000 — comparing two
+  runs trained for different lengths measures the schedule as much as the model.
+  The baseline file also matches `batches_per_val_step: 1000`, giving both arms
+  20 val points so the PER curves line up. Longer is safe rather than merely
+  generous: evaluation loads `checkpoint/best_checkpoint`, chosen on lowest val
+  PER, so steps past the optimum cost wall-clock and do not corrupt the result.
+  If val PER plateaus then climbs, rerun **both** arms at a lower count.
 * **`diphone.close_with_sil`.** `false` (default) → a length-`L` phoneme
   sequence becomes `L-1` consecutive diphones, the textbook DCoND form and
   strictly easier for CTC than the baseline, which needed `L` frames. `true` →
@@ -422,9 +448,17 @@ and evaluation does not.
 scalars, and `evaluate_diphone.py` installs it. Attributes of size > 1 are
 returned untouched.
 
-**If you want the original `evaluate_model.py` working again**, apply the same
-three-line shim there, or change line 186 to reuse `dataset._hdf5_scalar`. That
-edit touches a shared file, so it was left out of this folder on purpose.
+That upstream call site has since been **fixed** — line 186 now reads through a
+`decode_int_value` helper next to the existing `decode_text_value`, inside
+`evaluate_model_helpers.py` itself. The original `evaluate_model.py` therefore
+runs on numpy 2, which is what the baseline arm of the A/B needs (see step 8 of
+the runbook). The change is one attribute, one file, and strictly widening: on
+numpy 1 `int(array([8]))` was already 8.
+
+`h5py_compat.py` is kept anyway, because it covers the whole class of the bug
+rather than the one attribute that happened to be hit first — any size-1
+attribute, in any caller, upstream or not. The two are consistent, and
+`evaluate_diphone.py` still installs it.
 
 ---
 

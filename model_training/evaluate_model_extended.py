@@ -167,7 +167,8 @@ def _build_report(summary: Dict[str, object], detail_rows: List[Dict[str, object
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _load_session_bundle(session: str, data_dir: Path, eval_type: str, csv_df: Optional[pd.DataFrame]):
+def _load_session_bundle(session: str, data_dir: Path, eval_type: str, csv_df: Optional[pd.DataFrame],
+                         n_classes: Optional[int] = None):
     session_dir = data_dir / session
     eval_file = session_dir / f"data_{eval_type}.hdf5"
     if not eval_file.exists():
@@ -179,9 +180,24 @@ def _load_session_bundle(session: str, data_dir: Path, eval_type: str, csv_df: O
     if metadata_path.exists():
         source_order = load_session_phoneme_order(metadata_path)
     else:
-        n_classes = int(metadata.get("labels", {}).get("n_classes", 0))
-        if n_classes and n_classes != len(LOGIT_TO_PHONEME):
-            raise ValueError(f"Missing metadata.json for {session}; cannot map {n_classes}-class logits")
+        # No metadata.json: this session's own label order is unknown, so the
+        # official 41-class order is only a valid stand-in when the model really
+        # emits 41 classes.
+        #
+        # This used to assume that unconditionally. The guard read `n_classes`
+        # out of `metadata` -- the very dict that is `{}` in this branch -- so it
+        # could never fire, and the mistake surfaced much later as
+        # "logits last dimension (35) does not match source_order length (41)"
+        # from inside the LM path, with nothing pointing at the missing file.
+        if n_classes is not None and n_classes != len(LOGIT_TO_PHONEME):
+            raise ValueError(
+                f"Session {session!r} has no metadata.json, so its phoneme order is "
+                f"unknown, but the model emits {n_classes} classes while the official "
+                f"order has {len(LOGIT_TO_PHONEME)}. Copy a metadata.json into "
+                f"{session_dir} and rerun -- alt_models/session_metadata/ holds "
+                f"ready-made ones, and alt_models/trim_silence.py carries the file "
+                f"over automatically when it is present in the source session."
+            )
         source_order = LOGIT_TO_PHONEME
 
     return {
@@ -367,7 +383,8 @@ def main() -> None:
     session_summaries = []
 
     for session in model_args["dataset"]["sessions"]:
-        bundle = _load_session_bundle(session, Path(data_dir), eval_type, csv_df)
+        bundle = _load_session_bundle(session, Path(data_dir), eval_type, csv_df,
+                                      n_classes=model_args["dataset"].get("n_classes"))
         if bundle is None:
             print(f"Skipping {session}: missing data_{eval_type}.hdf5")
             continue
