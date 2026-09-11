@@ -66,6 +66,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
 | `tests/test_trim_silence.py` | 16 tests: keep-planning, adaptive VAD, real-data speech retention, session-stamp invariant. |
 | `tests/test_install_matlab_session.py` | 6 tests: metadata resolution and its diagnostics, attr rewrite, real-split install with no vocabulary on the box. |
+| `tests/test_make_all_day_config.py` | 5 tests: duplicate-recording detection, and that it does not fire on two real days. |
 
 Two config keys in the `model:` block select among four model classes:
 

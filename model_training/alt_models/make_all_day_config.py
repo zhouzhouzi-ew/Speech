@@ -36,6 +36,39 @@ def discover_sessions(dataset_dir: Path) -> list:
     return sessions
 
 
+def recording_fingerprint(session_dir: Path):
+    """`{(global_id, n_time_steps), ...}` for a session's train split.
+
+    Two directories holding the *same recording* produce the same set; two
+    genuinely different days do not. `global_id` alone is not enough -- it is
+    per-recording, so every day starts at 0 and 189-trial days all share the
+    range 0..188. Pairing it with each trial's own frame count is what separates
+    "day 2" from "day 2, copied".
+
+    Returns `None` if the file is missing or unreadable, so an odd session
+    degrades to "cannot tell" rather than a false accusation.
+    """
+    path = session_dir / "data_train.hdf5"
+    if not path.exists():
+        return None
+    try:
+        import numpy as np
+
+        entries = set()
+        with h5py.File(path, "r") as f:
+            for key in f.keys():
+                group = f[key]
+                gid = group.attrs.get("global_id")
+                nts = group.attrs.get("n_time_steps")
+                if gid is None or nts is None:
+                    return None
+                entries.add((int(np.asarray(gid).reshape(-1)[0]),
+                             int(np.asarray(nts).reshape(-1)[0])))
+    except Exception:  # noqa: BLE001
+        return None
+    return entries or None
+
+
 def check_for_trim_duplicates(dataset_dir: Path, sessions: list) -> None:
     """Refuse a `X` / `X_trim` pair sitting in the same dataset root.
 
@@ -62,6 +95,44 @@ def check_for_trim_duplicates(dataset_dir: Path, sessions: list) -> None:
             "trimmed root (e.g. ../data/hdf5_data_512_trim) or at the original, "
             "not at a directory containing both.", file=sys.stderr)
         raise SystemExit(1)
+
+
+def check_for_duplicate_recordings(dataset_dir: Path, sessions: list) -> None:
+    """Refuse two directories that hold the same recording under different names.
+
+    The `_trim` check above only catches the one suffix this project happens to
+    produce. Copying a session to fix the `_prevblockcal` suffix -- or renaming in
+    a way that leaves a copy behind -- slips past it and produces a 3-day config
+    from 2 days of data, with the same 189 sentences counted twice. The
+    fingerprint comparison catches any such pair regardless of naming.
+    """
+    prints = {}
+    for name in sessions:
+        prints[name] = recording_fingerprint(dataset_dir / name)
+
+    duplicates = []
+    names = sorted(prints)
+    for i, a in enumerate(names):
+        if prints[a] is None:
+            continue
+        for b in names[i + 1:]:
+            if prints[b] is not None and prints[a] == prints[b]:
+                duplicates.append((a, b))
+
+    if not duplicates:
+        return
+
+    print(f"\n{dataset_dir} holds the same recording under more than one name:\n",
+          file=sys.stderr)
+    for a, b in duplicates:
+        n = len(prints[a])
+        print(f"  {a}\n  {b}\n    ({n} identical trials: same global_id AND same "
+              "n_time_steps)\n", file=sys.stderr)
+    print(
+        "Each would become its own day layer, training twice on the same trials.\n"
+        "Delete the copy you do not want -- check which one has metadata.json and "
+        "matching `session` attributes first -- then rerun.", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def describe_session(session_dir: Path) -> str:
@@ -147,6 +218,7 @@ def main() -> None:
         print(f"No session directories with data_train.hdf5 under {dataset_dir}", file=sys.stderr)
         raise SystemExit(1)
     check_for_trim_duplicates(dataset_dir, sessions)
+    check_for_duplicate_recordings(dataset_dir, sessions)
 
     cfg.dataset.sessions = sessions
     # 1 == "validate on this day" (see rnn_trainer.validation). Every day is worth

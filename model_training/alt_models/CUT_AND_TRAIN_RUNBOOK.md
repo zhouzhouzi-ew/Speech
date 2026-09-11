@@ -42,13 +42,22 @@ ls -la alt_models/cut_plans/
 python alt_models/install_matlab_session.py \
     --source-dir /mnt/d/wwl/data/self_mat/hdf5_data_512/20260814-144544 \
     --dataset-dir ../data/hdf5_data_512 \
-    --metadata-from ../data/hdf5_data_512/t15.2026.08.14.10-11-24_tc_sbp_512
+    --session-name t15.2026.08.14.15-05-37_tc_sbp_512 \
+    --overwrite
 ```
+
+**Always pass `--session-name`.** The `_prevblockcal` suffix comes from the
+MATLAB script, which names the session after the block it calibrated against
+(`run_20260814_144544_512_hdf5_prevblock_calibration.m`) and stamps that string
+into all 189 trials. The installer's default is to reuse whatever MATLAB
+stamped, so leaving the flag off is what produces `..._tc_sbp_512_prevblockcal`.
+Nothing in this repo requires the suffix — pass the name you want and both the
+directory and every trial attribute take it.
 
 It reconciles the directory name against the per-trial `session` attribute
 (three strings have to agree exactly — see `README.md`), borrows
-`labels.phoneme_to_id` from day 1, and runs the audit itself. **It exits
-non-zero if the audit is not clean — stop there if it does.**
+`labels.phoneme_to_id` from day 1 if it can find one, and runs the audit itself.
+**It exits non-zero if the audit is not clean — stop there if it does.**
 
 Remember the name it prints; step 3 needs it:
 
