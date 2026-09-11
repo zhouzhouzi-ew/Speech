@@ -59,7 +59,17 @@ def describe_session(session_dir: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset_dir", type=str, default="../data/hdf5_data_512")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help=(
+            "Where to look for day directories. Defaults to the base config's own "
+            "dataset.dataset_dir. When passed, the value is also written into the "
+            "generated config -- otherwise the day list would be enumerated from "
+            "one directory while the config (and check_config.py) pointed at another."
+        ),
+    )
     parser.add_argument(
         "--config", type=str, default="alt_models/rnn_args_diphone.yaml"
     )
@@ -91,7 +101,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dataset_dir = Path(args.dataset_dir)
+    cfg = OmegaConf.load(args.config)
+
+    # Enumerate days from --dataset_dir when given, otherwise from whatever the
+    # base config already points at. Passing it explicitly also pins it into the
+    # output, so the enumerated day list and the directory check_config.py later
+    # validates are guaranteed to be the same one.
+    if args.dataset_dir:
+        cfg.dataset.dataset_dir = args.dataset_dir
+    dataset_dir = Path(str(cfg.dataset.dataset_dir))
     if not dataset_dir.is_dir():
         print(f"dataset_dir not found: {dataset_dir}", file=sys.stderr)
         raise SystemExit(1)
@@ -101,7 +119,6 @@ def main() -> None:
         print(f"No session directories with data_train.hdf5 under {dataset_dir}", file=sys.stderr)
         raise SystemExit(1)
 
-    cfg = OmegaConf.load(args.config)
     cfg.dataset.sessions = sessions
     # 1 == "validate on this day" (see rnn_trainer.validation). Every day is worth
     # reporting on; the train/val trial split itself comes from test_percentage.

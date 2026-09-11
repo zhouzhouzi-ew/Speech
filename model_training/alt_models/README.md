@@ -57,6 +57,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `rnn_args_diphone.yaml` | config (English 512D, copy task). |
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
 | `check_config.py` | pre-flight for the `sessions:` block — catches the silent one-day failure. |
+| `install_matlab_session.py` | installs a MATLAB `data_*.hdf5` folder as a session; reconciles the dir-name/attr split and supplies `metadata.json`. |
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
@@ -167,6 +168,44 @@ to override.
 > (`sub-01/run_20260814_nejm_512_hdf5_v6_prevblock_calibration.m`), not out of
 > `data_preprocessing/preprocess_sub01_english_electrode.py`, which is 256-dim
 > TC-only.
+
+### Installing a new day
+
+The MATLAB pipeline writes its HDF5s straight into a folder named after the
+**raw recording** (`.../self_mat/hdf5_data_512/20260814-144544/`) while stamping
+every trial with the **session** name
+(`t15.2026.08.14.15-05-37_tc_sbp_512_prevblockcal`). Both strings are
+load-bearing and they are not the same string:
+
+* `rnn_trainer.py:163` builds `<dataset_dir>/<config entry>/data_train.hdf5`, so
+  the config entry must equal the **directory** name;
+* `evaluate_model_extended.py:199` does `sessions.index(session)` on the
+  per-trial **attribute**.
+
+Three strings have to agree exactly — directory, config entry, attribute.
+MATLAB guarantees only the third, and it emits no `metadata.json` either.
+`install_matlab_session.py` closes both gaps, then runs `audit_hdf5.py` on the
+result and exits non-zero if it is not clean:
+
+```bash
+python alt_models/install_matlab_session.py \
+    --source-dir /mnt/d/wwl/data/self_mat/hdf5_data_512/20260814-144544 \
+    --dataset-dir ../data/hdf5_data_512 \
+    --session-name t15.2026.08.14.15-05-37_tc_sbp_512
+```
+
+Omit `--session-name` to keep the name MATLAB stamped. `--metadata-from` points
+at a session to borrow `labels.phoneme_to_id` from (day 1 is fine — the
+vocabulary is a fixed property of the corpus, which the audit re-checks
+afterwards by re-encoding every label).
+
+The labels themselves need no attention: the MATLAB script copies
+`seq_class_ids` and `transcription` directly out of the reference day's HDF5,
+so a new day cannot drift onto a different phoneme ordering. That is why
+`build_hdf5_from_mat.py` — which re-derives the encoding — is **not** the tool
+for MATLAB 512D output. It exists for `.mat` sources, and it runs strict
+precisely so that pointing it at the wrong corpus fails loudly instead of
+writing a session whose every label is a lone `<sil>`.
 
 ---
 
