@@ -58,9 +58,11 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
 | `check_config.py` | pre-flight for the `sessions:` block — catches the silent one-day failure. |
 | `install_matlab_session.py` | installs a MATLAB `data_*.hdf5` folder as a session; reconciles the dir-name/attr split and supplies `metadata.json`. |
+| `trim_silence.py` | drops over-long silent stretches from a session, using the session's microphone audio. |
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
+| `tests/test_trim_silence.py` | 13 tests: keep-planning, adaptive VAD, real-data speech retention. |
 
 Two config keys in the `model:` block select among four model classes:
 
@@ -206,6 +208,49 @@ so a new day cannot drift onto a different phoneme ordering. That is why
 for MATLAB 512D output. It exists for `.mat` sources, and it runs strict
 precisely so that pointing it at the wrong corpus fails loudly instead of
 writing a session whose every label is a lone `<sil>`.
+
+### Trimming over-long silence
+
+`read_begin`/`read_end` come from the task CSV, not from the subject's voice,
+so a late marker or a long pause yields a trial that is almost entirely room
+tone. The 2026-08-14 15-05-37 session runs 3.6 s to 57.4 s per trial (median
+6.8 s), with gid 105 at 50.0 s and gid 119 at 57.4 s; day 1 has the same shape
+(gid 148 at 52.3 s). Those trials cost a disproportionate amount of memory and
+compute and teach the model nothing.
+
+```bash
+python alt_models/trim_silence.py \
+    --session-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512 \
+    --audio /mnt/d/wwl/.../session-15-05-37/EnglishSpeech/microphone_audio.wav \
+    --out-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512_trim
+```
+
+Run with `--dry-run` first; it prints the full report and writes nothing. Then
+`audit_hdf5.py` the output before training. `--task-csv` defaults to the only
+`data_*.csv` sitting next to the wav.
+
+It uses a 20 ms-frame VAD over the trial's own audio. Feature row `k` is at
+`read_begin + k*20 ms` — checked against all 189 day-1 trials, where
+`n_time_steps == floor(read_duration_sec * 50)` exactly — and sample 0 of the
+wav is the CSV's `mic_start` event. The threshold is set from the trial's own
+percentiles (`p95 - 22 dB`, floored at `p20 + 20 dB`) rather than an absolute
+level, because room tone here ranges over 15–35 dB between sessions. A trial
+with under 15 dB of speech-to-noise contrast is left untouched and reported.
+
+Leading and trailing silence is capped at `--edge-keep-ms`; silent runs longer
+than `--max-silence-ms` are collapsed to `--keep-silence-ms`, so the pause stays
+visible as a pause instead of vanishing.
+
+**`seq_class_ids` is never modified.** CTC sums over alignment paths, so it
+needs no frame-level alignment — removing input frames cannot invalidate the
+transcript provided at least `L` frames remain. The script enforces that and
+reports any trial where it had to clamp. On day 1 it removes 39 % of all frames
+while retaining **100 % of the frames the VAD called speech**, on all 189
+trials.
+
+> Trim every day with the same flags. A model trained on trimmed day 2 and
+> untrimmed day 1 is being asked to reconcile two input distributions on top of
+> the day difference it is meant to be learning.
 
 ---
 
