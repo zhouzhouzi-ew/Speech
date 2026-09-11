@@ -59,8 +59,8 @@ def _mask(spec: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 def test_edges_are_trimmed_to_the_margin():
     speech = _mask("____########____")           # 4 silent each side
-    keep = plan_keep(speech, HOP_MS, edge_keep_ms=40, max_silence_ms=1000,
-                     keep_silence_ms=200)
+    keep = plan_keep(speech, HOP_MS, max_silence_ms=1000, keep_silence_ms=200,
+                     edge_keep_ms=40)
     # 40 ms = 2 frames of margin retained on each side
     assert keep.sum() == 8 + 2 + 2
     assert not keep[:2].any() and not keep[-2:].any()
@@ -70,15 +70,15 @@ def test_edges_are_trimmed_to_the_margin():
 def test_short_internal_silences_are_left_alone():
     """A normal inter-word pause must survive -- it is what `<sil>` labels."""
     speech = _mask("##_##_##")                   # 1-frame gaps, well under 1000 ms
-    keep = plan_keep(speech, HOP_MS, edge_keep_ms=200, max_silence_ms=1000,
-                     keep_silence_ms=200)
+    keep = plan_keep(speech, HOP_MS, max_silence_ms=1000, keep_silence_ms=200,
+                     edge_keep_ms=200)
     assert keep.all(), "gaps shorter than max_silence_ms must not be collapsed"
 
 
 def test_a_long_internal_silence_is_collapsed_to_the_keep_length():
     speech = _mask("##" + "_" * 100 + "##")      # 2000 ms of silence
-    keep = plan_keep(speech, HOP_MS, edge_keep_ms=200, max_silence_ms=1000,
-                     keep_silence_ms=200)
+    keep = plan_keep(speech, HOP_MS, max_silence_ms=1000, keep_silence_ms=200,
+                     edge_keep_ms=200)
     # 200 ms of the run survives (10 frames), the other 90 frames go
     assert keep.sum() == 4 + 10
     assert keep.nonzero()[0].tolist()[:2] == [0, 1]
@@ -88,15 +88,33 @@ def test_a_long_internal_silence_is_collapsed_to_the_keep_length():
 def test_collapse_is_relative_not_absolute():
     """500 ms of silence is only collapsed when the threshold says so."""
     speech = _mask("##" + "_" * 25 + "##")       # 500 ms
-    tight = plan_keep(speech, HOP_MS, 200, max_silence_ms=300, keep_silence_ms=200)
-    loose = plan_keep(speech, HOP_MS, 200, max_silence_ms=1000, keep_silence_ms=200)
+    tight = plan_keep(speech, HOP_MS, max_silence_ms=300, keep_silence_ms=200,
+                      edge_keep_ms=200)
+    loose = plan_keep(speech, HOP_MS, max_silence_ms=1000, keep_silence_ms=200,
+                      edge_keep_ms=200)
     assert tight.sum() == 4 + 10
     assert loose.sum() == len(speech)
 
 
+def test_the_default_rule_only_touches_silences_over_the_threshold():
+    """The instruction is "delete silence longer than 2 s", not "delete silence".
+
+    So a 1.5 s pause anywhere in the trial -- including at the edges -- has to
+    come through untouched, and only the 2.5 s one is cut.
+    """
+    # 20 ms per frame, so 1.5 s = 75 frames, 100 ms = 5, 2.5 s = 125.
+    speech = _mask("_" * 75 + "#" * 4 + "_" * 5 + "#" * 4 + "_" * 125)
+    keep = plan_keep(speech, HOP_MS, max_silence_ms=2000, keep_silence_ms=0,
+                     edge_keep_ms=None)
+    assert keep[:75].all(), "the 1.5 s lead is under the threshold -- it stays"
+    assert not keep[88:].any(), "the 2.5 s tail is over the threshold -- it goes"
+    assert keep[75:88].all(), "speech and the 100 ms gap both stay"
+
+
 def test_no_speech_means_nothing_is_removed():
     """An all-silence trial must pass through, not be deleted."""
-    keep = plan_keep(_mask("_" * 50), HOP_MS, 200, 1000, 200)
+    keep = plan_keep(_mask("_" * 50), HOP_MS, max_silence_ms=1000,
+                     keep_silence_ms=200, edge_keep_ms=200)
     assert keep.all()
 
 
@@ -104,15 +122,16 @@ def test_speech_frames_always_survive():
     """The invariant the whole script rests on.
 
     Note the direction: `keep` is *allowed* to retain silence (that is what the
-    edge margin and the collapsed-run tail are), so the claim is not
-    `speech[keep].all()` -- it is that no speech frame is dropped.
+    collapsed-run tail and any explicit `edge_keep_ms` margin are), so the claim
+    is not `speech[keep].all()` -- it is that no speech frame is dropped.
     """
     rng = np.random.default_rng(0)
     for _ in range(200):
         speech = rng.random(300) < 0.3
         if not speech.any():
             continue
-        keep = plan_keep(speech, HOP_MS, 200, 1000, 200)
+        keep = plan_keep(speech, HOP_MS, max_silence_ms=2000, keep_silence_ms=0,
+                         edge_keep_ms=None)
         assert speech[keep].sum() == speech.sum(), \
             "a frame the VAD called speech was dropped"
 
@@ -234,7 +253,8 @@ def test_real_trimming_removes_no_speech():
                 db = frame_db(audio, fs, t0, n, hop)
                 speech, _, _ = speech_mask(db, 22.0, 20.0)
                 assert speech is not None, f"{split}/{key} gid {gid}: no contrast"
-                keep = plan_keep(speech, 20.0, 200.0, 1000.0, 200.0)
+                keep = plan_keep(speech, 20.0, max_silence_ms=2000,
+                                 keep_silence_ms=0, edge_keep_ms=None)
                 assert speech[keep].sum() == speech.sum(), (
                     f"{split}/{key} gid {gid}: trimming dropped "
                     f"{int(speech.sum() - speech[keep].sum())} speech frames"

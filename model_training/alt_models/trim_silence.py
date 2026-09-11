@@ -1,56 +1,50 @@
 #!/usr/bin/env python3
-"""Trim over-long silent stretches out of an HDF5 session, guided by the mic audio.
+"""Remove over-long silent stretches from an HDF5 session.
 
-Why this exists
----------------
-`read_begin`/`read_end` comes from the task CSV, not from the subject's actual
-voice. When a marker fires late (or the subject pauses for tens of seconds) the
-resulting trial is mostly room tone: on the 2026-08-14 15-05-37 session the read
-durations run 3.6 s to 57.4 s, median 6.8 s, with gid 105 at 50.0 s and gid 119
-at 57.4 s. Those trials are ~100 % silence, cost a disproportionate amount of
-memory and compute, and contribute gradients that teach the model nothing.
+The rule is one line: **any silent run longer than `--max-silence-ms` (default
+2 s) is cut back to `--keep-silence-ms` (default 0, i.e. removed).** Short
+pauses -- the ones between words, which is what the `<sil>` labels in
+`seq_class_ids` describe -- are left exactly as they are.
 
-What it does
-------------
-For each trial it builds a 20 ms-frame voice-activity mask from the microphone
-recording, then drops frames:
+Why this is needed
+------------------
+`read_begin`/`read_end` comes from the task CSV, not from the subject's voice.
+When a marker fires late or the subject pauses, the trial is mostly room tone:
+on 2026-08-14 the read durations run 3.6 s to 57.4 s (median 6.8 s), with
+gid 105 at 50.0 s and gid 119 at 57.4 s on the 15-05-37 session and gid 148 at
+52.3 s on the 10-11-24 one.
 
-  * leading and trailing silence, beyond `--edge-keep-ms` each;
-  * any *internal* silent run longer than `--max-silence-ms`, collapsed to
-    `--keep-silence-ms` so the pause is still visible to the model as a pause.
+Two-stage, because the audio is not always present
+--------------------------------------------------
+The VAD needs the microphone recording. On a training box that only has the
+HDF5, use the plan:
 
-`seq_class_ids` is deliberately **not** touched. CTC needs no frame-level
-alignment -- it sums over every alignment path -- so removing frames from the
-input cannot invalidate the transcript, as long as at least `L` frames survive.
-The script enforces that and reports it per trial.
-
-How the frames line up
-----------------------
-Verified against the shipped day-1 session: for all 189 trials,
-
-    n_time_steps == floor(read_duration_sec * 50)
-
-i.e. 20 ms per row, and row `k` covers wall time
-`[read_begin + k*0.02, read_begin + (k+1)*0.02)` seconds. The audio's sample 0 is
-the CSV's `audio_record`/`mic_start` event, so a wall clock time `t` is at
-sample `(t - mic_start) * fs`. That holds to within 0.05 s of the file's own
-duration on the session this was written against. The script re-checks the
-`n_time_steps` identity per trial and refuses to touch a trial that violates it.
-
-Usage
------
-    cd Speech/model_training
+    # where the audio lives -- build a plan once (no --session-dir == plan only)
     python alt_models/trim_silence.py \
-        --session-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512 \
-        --audio /mnt/d/wwl/.../session-15-05-37/EnglishSpeech/microphone_audio.wav \
-        --out-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512_trim
+        --audio .../session-10-11-24/EnglishSpeech/microphone_audio.wav \
+        --out-plan alt_models/cut_plans/2026-08-14_10-11-24.json
 
-Add `--dry-run` first: it prints the same report and writes nothing. Then run
-`alt_models/audit_hdf5.py` on the output before training on it.
+    # anywhere -- apply it, no audio needed
+    python alt_models/trim_silence.py --plan alt_models/cut_plans/2026-08-14_10-11-24.json \
+        --session-dir ../data/hdf5_data_512/t15.2026.08.14.10-11-24_tc_sbp_512 \
+        --out-dir     ../data/hdf5_data_512/t15.2026.08.14.10-11-24_tc_sbp_512_trim
 
-Trim every day with the same flags -- a model trained on trimmed day 2 and
-untrimmed day 1 is being asked to reconcile two different input distributions
-on top of the day difference it is supposed to be learning.
+A plan is keyed by `global_id` and records each trial's expected bin count, so
+applying it to the wrong session is detected rather than silently misaligned.
+`--audio` + `--session-dir` together still work in one shot when both are
+present.
+
+`seq_class_ids` is never modified. CTC sums over alignment paths, so it needs no
+frame-level alignment: dropping input frames cannot invalidate the transcript as
+long as at least `L` frames remain. That is enforced per trial and reported.
+
+How frames line up
+------------------
+Verified against the shipped day-1 session: for all 189 trials
+`n_time_steps == floor(read_duration_sec * 50)`, i.e. 20 ms per row, and row `k`
+covers `[read_begin + k*0.02, read_begin + (k+1)*0.02)` seconds. Sample 0 of the
+wav is the CSV's `audio_record`/`mic_start` event. The plan records the bin count
+it was built for; applying to a trial whose row count differs is refused.
 """
 
 from __future__ import annotations
@@ -95,14 +89,14 @@ def parse_task_csv(path: Path):
             "aligned to wall clock. Every trial's read_begin would be wrong."
         )
 
-    trials, pending_begin = {}, {}
+    trials, pending = {}, {}
     for r in rows:
-        ev = r["EventType"]
-        if ev == "mark":
-            if r["Data3"] == "read_begin":
-                pending_begin[r["Data1"]] = stamp(r)
-            elif r["Data3"] == "read_end" and r["Data1"] in pending_begin:
-                trials[int(r["Data1"])] = (pending_begin.pop(r["Data1"]), stamp(r))
+        if r["EventType"] != "mark":
+            continue
+        if r["Data3"] == "read_begin":
+            pending[r["Data1"]] = stamp(r)
+        elif r["Data3"] == "read_end" and r["Data1"] in pending:
+            trials[int(r["Data1"])] = (pending.pop(r["Data1"]), stamp(r))
     if not trials:
         raise SystemExit(f"{path}: no read_begin/read_end pairs found")
     return mic_start, trials
@@ -122,18 +116,16 @@ def load_audio(path: Path):
 def frame_db(audio: np.ndarray, fs: int, t0_sec: float, n_bins: int, hop: int):
     """Per-20 ms-frame RMS in dB, exactly `n_bins` long, starting at `t0_sec`.
 
-    Reading exactly the frames the feature matrix has (rather than framing the
-    whole file and slicing) is what makes row `k` of the matrix and element `k`
-    of the mask the same instant by construction.
+    Framing exactly what the feature matrix has (rather than framing the whole
+    file and slicing) is what makes row `k` of the matrix and element `k` of the
+    mask the same instant by construction.
     """
     start = int(round(t0_sec * fs))
     seg = audio[start:start + n_bins * hop]
-    usable = len(seg) // hop
-    if usable < n_bins:
+    if len(seg) < n_bins * hop:
         seg = np.pad(seg, (0, n_bins * hop - len(seg)))
     frames = seg[:n_bins * hop].reshape(n_bins, hop)
-    rms = np.sqrt((frames ** 2).mean(axis=1))
-    return 20.0 * np.log10(rms + 1e-6)
+    return 20.0 * np.log10(np.sqrt((frames ** 2).mean(axis=1)) + 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +134,16 @@ def frame_db(audio: np.ndarray, fs: int, t0_sec: float, n_bins: int, hop: int):
 def speech_mask(db: np.ndarray, below_peak_db: float, above_floor_db: float):
     """Frames within `below_peak_db` of the trial's own speech level.
 
-    Absolute thresholds do not survive a session change (room tone here sits at
-    15-35 dB and speech at 60-78 dB); these two percentile rules do, and the
-    `max` keeps a trial that is *entirely* room tone from classifying every
-    frame as speech.
+    Absolute thresholds do not survive a session change -- room tone on these
+    recordings spans 15-35 dB while speech sits at 60-78 dB -- but these two
+    percentile rules do. The `max` keeps a trial that is *entirely* room tone
+    from classifying every frame as speech. Returns `(None, peak, floor)` when
+    the contrast is too small to decide, so the caller can leave it alone.
     """
     peak = float(np.percentile(db, 95))
     floor = float(np.percentile(db, 20))
     if peak - floor < 15.0:
-        return None, peak, floor          # no usable contrast in this trial
+        return None, peak, floor
     return db >= max(peak - below_peak_db, floor + above_floor_db), peak, floor
 
 
@@ -158,43 +151,127 @@ def _runs(mask: np.ndarray):
     """Yield `(value, start, stop)` for each constant run, stop exclusive."""
     if mask.size == 0:
         return
-    edges = np.flatnonzero(np.diff(mask.astype(np.int8))) + 1
+    edges = np.flatnonzero(np.diff(np.asarray(mask, dtype=np.int8))) + 1
     bounds = np.concatenate(([0], edges, [mask.size]))
     for a, b in zip(bounds[:-1], bounds[1:]):
         yield bool(mask[a]), int(a), int(b)
 
 
-def plan_keep(speech: np.ndarray, hop_ms: float, edge_keep_ms: float,
-              max_silence_ms: float, keep_silence_ms: float) -> np.ndarray:
-    """Boolean `keep` over frames: edge silence capped, long internal silences collapsed."""
+def plan_keep(speech: np.ndarray, hop_ms: float, max_silence_ms: float,
+              keep_silence_ms: float, edge_keep_ms: float | None = None) -> np.ndarray:
+    """Boolean `keep`: drop silent runs longer than `max_silence_ms`.
+
+    Each dropped run leaves `keep_silence_ms` behind, so a long pause is
+    *shortened* rather than erased and the model still sees a boundary.
+    `edge_keep_ms` additionally caps leading/trailing silence; leaving it `None`
+    means the edges obey the same rule as everything else, which is what you
+    want when the instruction is "only touch silences over 2 s".
+    """
     n = speech.size
     keep = np.ones(n, dtype=bool)
     if not speech.any():
         return keep
 
-    edge_bins = int(round(edge_keep_ms / hop_ms))
-    max_sil_bins = max_silence_ms / hop_ms
-    keep_sil_bins = int(round(keep_silence_ms / hop_ms))
-
-    first = int(np.argmax(speech))
-    last = int(n - 1 - np.argmax(speech[::-1]))
-
-    keep[: max(0, first - edge_bins)] = False
-    keep[min(n, last + 1 + edge_bins):] = False
+    max_bins = max_silence_ms / hop_ms
+    keep_bins = int(round(keep_silence_ms / hop_ms))
 
     for is_speech, a, b in _runs(speech):
-        if is_speech or a == 0 or b == n:
-            continue                       # edges handled above
-        if (b - a) > max_sil_bins:
-            keep[a + keep_sil_bins: b] = False
+        if is_speech or (b - a) <= max_bins:
+            continue
+        keep[a + keep_bins: b] = False
+
+    if edge_keep_ms is not None:
+        edge_bins = int(round(edge_keep_ms / hop_ms))
+        first = int(np.argmax(speech))
+        last = int(n - 1 - np.argmax(speech[::-1]))
+        keep[: max(0, first - edge_bins)] = False
+        keep[min(n, last + 1 + edge_bins):] = False
     return keep
 
 
+def cut_ranges(keep: np.ndarray):
+    """`[[start, stop), ...]` frame ranges to delete."""
+    return [[a, b] for v, a, b in _runs(~np.asarray(keep, dtype=bool)) if v]
+
+
+def _trim_one(db, n_ids, args):
+    """Return `(keep, note)` for one trial's frame-level dB curve."""
+    speech, peak, floor = speech_mask(db, args.below_peak_db, args.above_floor_db)
+    if speech is None:
+        return np.ones(db.size, dtype=bool), (
+            f"no speech/room-tone contrast ({peak - floor:.1f} dB) -- left untouched")
+    keep = plan_keep(speech, args.hop_ms, args.max_silence_ms, args.keep_silence_ms,
+                     args.edge_keep_ms)
+    n_keep = int(keep.sum())
+    if n_keep < n_ids:
+        # CTC needs at least one frame per label. Keeping the loudest frames is a
+        # strictly better failure mode than writing a trial the loss cannot align
+        # at all -- but it is still a compromise, so it is reported, not silent.
+        keep = np.zeros(db.size, dtype=bool)
+        keep[np.sort(np.argsort(-db)[:n_ids])] = True
+        return keep, (f"trim left {n_keep} < {n_ids} labels -- clamped back to "
+                      "the loudest frames")
+    return keep, ""
+
+
 # ---------------------------------------------------------------------------
-# driver
+# plans
 # ---------------------------------------------------------------------------
-def process_split(path: Path, out_path: Path, audio: np.ndarray, fs: int, hop: int,
-                  mic_start, trials: dict, args, write: bool, session_name):
+def build_plan(audio, fs, hop, mic_start, trials, args) -> dict:
+    """VAD every trial straight from the CSV, with no HDF5 needed.
+
+    This is why a plan can be built on a machine that has the audio even though
+    the session it will be applied to does not exist yet.
+    """
+    args.hop_ms = 1000.0 * hop / fs
+    entries, report = {}, []
+    for gid, (t0, t1) in sorted(trials.items()):
+        read_sec = (t1 - t0).total_seconds()
+        n_bins = int(np.floor(read_sec * FEATURE_HZ))
+        if n_bins <= 0:
+            continue
+        db = frame_db(audio, fs, (t0 - mic_start).total_seconds(), n_bins, hop)
+        keep, note = _trim_one(db, 0, args)
+        cuts = cut_ranges(keep)
+        entries[str(gid)] = {
+            "n_bins": n_bins,
+            "read_duration_sec": round(read_sec, 4),
+            "read_begin": t0.isoformat(),
+            "cut": cuts,
+        }
+        report.append({"global_id": gid, "split": "", "trial": "",
+                       "bins_before": n_bins, "n_labels": -1,
+                       "bins_after": int(keep.sum()),
+                       "removed": n_bins - int(keep.sum()), "note": note,
+                       "read_duration_sec": read_sec})
+    return {
+        "source": {"audio": str(args.audio), "task_csv": str(args.task_csv),
+                   "mic_start": mic_start.isoformat()},
+        "params": {
+            "max_silence_ms": args.max_silence_ms,
+            "keep_silence_ms": args.keep_silence_ms,
+            "edge_keep_ms": args.edge_keep_ms,
+            "below_peak_db": args.below_peak_db,
+            "above_floor_db": args.above_floor_db,
+            "frame_ms": round(args.hop_ms, 4),
+        },
+        "trials": entries,
+    }, report
+
+
+def load_plan(path: Path) -> dict:
+    plan = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "trials" not in plan:
+        raise SystemExit(f"{path}: not a cut plan (no `trials` key)")
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# applying
+# ---------------------------------------------------------------------------
+def process_split(path: Path, out_path: Path, plan: dict, args, write: bool,
+                  session_name):
+    """Apply a plan to one split. `plan` maps gid -> {n_bins, cut}."""
     rows = []
     dst = h5py.File(out_path, "w") if write else None
     with h5py.File(path, "r") as src:
@@ -209,54 +286,35 @@ def process_split(path: Path, out_path: Path, audio: np.ndarray, fs: int, hop: i
                    "global_id": gid, "bins_before": n_bins, "n_labels": n_ids,
                    "bins_after": n_bins, "removed": 0, "note": ""}
 
+            entry = plan["trials"].get(str(gid))
             keep = np.ones(n_bins, dtype=bool)
-            db = None
-            span = trials.get(gid)
-            if span is None:
-                row["note"] = "global_id not in task CSV -- left untouched"
-            elif (span[1] - span[0]).total_seconds() * FEATURE_HZ < n_bins - 2:
-                row["note"] = "read window shorter than feature rows -- left untouched"
+            if entry is None:
+                row["note"] = "global_id absent from the cut plan -- left untouched"
+            elif entry["n_bins"] != n_bins:
+                row["note"] = (f"plan expects {entry['n_bins']} bins but this trial "
+                               f"has {n_bins} -- REFUSED (frames would misalign)")
             else:
-                t0 = (span[0] - mic_start).total_seconds()
-                db = frame_db(audio, fs, t0, n_bins, hop)
-                speech, peak, floor = speech_mask(db, args.below_peak_db,
-                                                  args.above_floor_db)
-                if speech is None:
-                    row["note"] = (f"no speech/room-tone contrast "
-                                   f"({peak - floor:.1f} dB) -- left untouched")
-                    db = None
-                else:
-                    keep = plan_keep(speech, 1000.0 * hop / fs, args.edge_keep_ms,
-                                     args.max_silence_ms, args.keep_silence_ms)
+                for a, b in entry["cut"]:
+                    keep[a:b] = False
+                if int(keep.sum()) < n_ids:
+                    row["note"] = (f"plan would leave {int(keep.sum())} < {n_ids} "
+                                   "labels -- left untouched")
 
             n_keep = int(keep.sum())
-            if n_keep < n_ids and db is not None:
-                # CTC needs at least one frame per label. Keeping the loudest
-                # frames is a strictly better failure mode than writing a trial
-                # the loss cannot align at all -- but it is still a compromise,
-                # so it lands in the report rather than passing silently.
-                row["note"] = (f"trim left {n_keep} < {n_ids} labels -- clamped "
-                               "back to the loudest frames")
-                keep = np.zeros(n_bins, dtype=bool)
-                keep[np.sort(np.argsort(-db)[:n_ids])] = True
-                n_keep = n_ids
-
             if write:
                 out = dst.create_group(key)
                 out.create_dataset("input_features", data=feats[keep],
-                                   dtype=feats.dtype, compression=None)
+                                   dtype=feats.dtype)
                 for name in g:
-                    if name == "input_features":
-                        continue
-                    g.copy(name, out, name=name)
+                    if name != "input_features":
+                        g.copy(name, out, name=name)
                 for k, v in g.attrs.items():
                     out.attrs[k] = v
                 out.attrs["n_time_steps"] = np.int32(n_keep)
                 out.attrs["silence_trim"] = json.dumps({
                     "bins_before": int(n_bins), "bins_after": n_keep,
-                    "max_silence_ms": args.max_silence_ms,
-                    "keep_silence_ms": args.keep_silence_ms,
-                    "edge_keep_ms": args.edge_keep_ms,
+                    "max_silence_ms": plan["params"]["max_silence_ms"],
+                    "keep_silence_ms": plan["params"]["keep_silence_ms"],
                 })
                 if session_name:
                     out.attrs["session"] = session_name
@@ -272,65 +330,104 @@ def process_split(path: Path, out_path: Path, audio: np.ndarray, fs: int, hop: i
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--session-dir", required=True,
+    p.add_argument("--session-dir", default=None,
                    help="session dir holding data_{train,val,test}.hdf5")
-    p.add_argument("--audio", required=True, help="microphone_audio.wav")
+    p.add_argument("--audio", default=None, help="microphone_audio.wav")
     p.add_argument("--task-csv", default=None,
                    help="task CSV with read_begin/read_end; defaults to the only "
                         "data_*.csv next to --audio")
     p.add_argument("--out-dir", default=None,
                    help="where to write the trimmed session; defaults to "
                         "<session-dir>_trim")
-    p.add_argument("--max-silence-ms", type=float, default=1000.0,
-                   help="internal silent runs longer than this are collapsed (default 1000)")
-    p.add_argument("--keep-silence-ms", type=float, default=200.0,
-                   help="how much of a collapsed run to keep (default 200)")
-    p.add_argument("--edge-keep-ms", type=float, default=200.0,
-                   help="leading/trailing silence to keep (default 200)")
-    p.add_argument("--below-peak-db", type=float, default=22.0,
-                   help="a frame is speech if within this of the trial's p95 (default 22)")
-    p.add_argument("--above-floor-db", type=float, default=20.0,
-                   help="...and at least this far above the trial's p20 (default 20)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="report only; write nothing")
+    p.add_argument("--out-plan", default=None,
+                   help="write the computed cut plan here (for use without audio)")
+    p.add_argument("--plan", default=None,
+                   help="apply a previously built cut plan instead of the audio")
+    p.add_argument("--max-silence-ms", type=float, default=2000.0,
+                   help="silent runs longer than this are cut (default 2000)")
+    p.add_argument("--keep-silence-ms", type=float, default=0.0,
+                   help="how much of a cut run survives (default 0 = removed)")
+    p.add_argument("--edge-keep-ms", type=float, default=None,
+                   help="also cap leading/trailing silence at this; default is to "
+                        "apply the same >max-silence-ms rule to the edges")
+    p.add_argument("--below-peak-db", type=float, default=22.0)
+    p.add_argument("--above-floor-db", type=float, default=20.0)
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
+
+    if args.plan and (args.audio or args.out_plan):
+        raise SystemExit("--plan cannot be combined with --audio/--out-plan")
+    if not args.plan and not args.audio:
+        raise SystemExit("pass either --audio (to measure) or --plan (to apply)")
+
+    report = None
+    if args.plan:
+        plan = load_plan(Path(args.plan))
+        print(f"plan    : {args.plan}")
+        print(f"built   : max_silence={plan['params']['max_silence_ms']} ms, "
+              f"keep={plan['params']['keep_silence_ms']} ms, "
+              f"frame={plan['params']['frame_ms']} ms")
+        print(f"source  : {plan['source']['task_csv']}")
+        args.max_silence_ms = plan["params"]["max_silence_ms"]
+        args.keep_silence_ms = plan["params"]["keep_silence_ms"]
+    else:
+        audio_path = Path(args.audio)
+        if not audio_path.exists():
+            raise SystemExit(f"audio not found: {audio_path.resolve()}")
+        csv_path = Path(args.task_csv) if args.task_csv else None
+        if csv_path is None:
+            found = sorted(audio_path.parent.glob("data_*.csv"))
+            if len(found) != 1:
+                raise SystemExit(
+                    f"expected exactly one data_*.csv next to {audio_path}, found "
+                    f"{[f.name for f in found]} -- pass --task-csv")
+            csv_path = found[0]
+        args.audio, args.task_csv = audio_path, csv_path
+        mic_start, trials = parse_task_csv(csv_path)
+        audio, fs = load_audio(audio_path)
+        hop = int(round(0.02 * fs))
+        print(f"audio   : {audio_path}")
+        print(f"task csv: {csv_path}")
+        print(f"audio {len(audio)/fs:.1f} s @ {fs} Hz | mic_start {mic_start} | "
+              f"{len(trials)} trials in CSV | frame {1000.0*hop/fs:.3f} ms")
+        plan, report = build_plan(audio, fs, hop, mic_start, trials, args)
+
+    if args.out_plan:
+        out_plan = Path(args.out_plan)
+        out_plan.parent.mkdir(parents=True, exist_ok=True)
+        out_plan.write_text(json.dumps(plan, indent=1), encoding="utf-8")
+        cut = sum(len(t["cut"]) for t in plan["trials"].values())
+        saved = sum(sum(b - a for a, b in t["cut"]) for t in plan["trials"].values())
+        print(f"\nplan written: {out_plan}  ({len(plan['trials'])} trials, "
+              f"{cut} cut ranges, {saved} bins = {saved*0.02:.1f} s)")
+        if report:
+            _print_report(report)
+
+    if not args.session_dir:
+        if not args.out_plan:
+            raise SystemExit("nothing to do: pass --session-dir, or --out-plan")
+        return 0
 
     session_dir = Path(args.session_dir)
     if not session_dir.is_dir():
         raise SystemExit(f"session dir not found: {session_dir}")
+    # Default to a *parallel dataset root*, not a `_trim` sibling. A sibling would
+    # make `make_all_day_config.py` enumerate both the trimmed and untrimmed copy
+    # as two separate days -- the model would get two day layers for one day of
+    # data, and the duplicate would be the untrimmed one. Keeping the session name
+    # identical also means the trial `session` attribute needs no rewrite, since it
+    # already equals the directory name.
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        root = session_dir.parent
+        out_dir = root.with_name(root.name + "_trim") / session_dir.name
+    session_name = out_dir.name if out_dir.name != session_dir.name else None
 
-    audio_path = Path(args.audio)
-    csv_path = Path(args.task_csv) if args.task_csv else None
-    if csv_path is None:
-        found = sorted(audio_path.parent.glob("data_*.csv"))
-        if len(found) != 1:
-            raise SystemExit(
-                f"expected exactly one data_*.csv next to {audio_path}, found "
-                f"{[f.name for f in found]} -- pass --task-csv"
-            )
-        csv_path = found[0]
-
-    out_dir = Path(args.out_dir) if args.out_dir else session_dir.with_name(
-        session_dir.name + "_trim")
-    session_name = None
-    if out_dir.name != session_dir.name:
-        session_name = out_dir.name
-
-    print(f"session : {session_dir.name}")
-    print(f"audio   : {audio_path}")
-    print(f"task csv: {csv_path}")
+    print(f"\nsession : {session_dir.name}")
     print(f"output  : {'(dry run)' if args.dry_run else out_dir}")
     print()
-
-    mic_start, trials = parse_task_csv(csv_path)
-    audio, fs = load_audio(audio_path)
-    hop = int(round(0.02 * fs))
-
-    print(f"audio {len(audio)/fs:.1f} s @ {fs} Hz | mic_start {mic_start} "
-          f"| {len(trials)} trials in CSV")
-    print(f"frame = {1000.0 * hop / fs:.3f} ms (nominal 20)\n")
-
     if not args.dry_run:
         if out_dir.exists():
             if not args.overwrite:
@@ -343,59 +440,64 @@ def main() -> int:
         src = session_dir / f"data_{split}.hdf5"
         if not src.exists():
             continue
-        rows = process_split(src, out_dir / src.name, audio, fs, hop, mic_start,
-                             trials, args, write=not args.dry_run,
-                             session_name=session_name)
+        rows = process_split(src, out_dir / src.name, plan, args,
+                             write=not args.dry_run, session_name=session_name)
         all_rows.extend(rows)
         removed = sum(r["removed"] for r in rows)
         before = sum(r["bins_before"] for r in rows)
-        print(f"{split:>5}: {len(rows):>3} trials  {before:>7} -> {before - removed:>7} bins "
-              f"({100.0 * removed / max(before, 1):5.1f}% removed)")
+        print(f"{split:>5}: {len(rows):>3} trials  {before:>7} -> {before-removed:>7} bins "
+              f"({100.0*removed/max(before,1):5.1f}% removed)")
 
     if not args.dry_run:
         for name in CARRY_OVER:
             s = session_dir / name
             if s.exists():
                 shutil.copy2(s, out_dir / name)
-        if session_name:
-            meta_path = out_dir / "metadata.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                meta["session"] = session_name
-                meta["silence_trim"] = {
-                    "source_session": session_dir.name,
-                    "max_silence_ms": args.max_silence_ms,
-                    "keep_silence_ms": args.keep_silence_ms,
-                    "edge_keep_ms": args.edge_keep_ms,
-                }
-                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        meta_path = out_dir / "metadata.json"
+        if session_name and meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["session"] = session_name
+            meta["silence_trim"] = {"source_session": session_dir.name,
+                                    **plan["params"]}
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    report = out_dir / "trim_report.csv" if not args.dry_run else None
-    if report is not None:
-        with open(report, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(all_rows[0].keys()))
-            w.writeheader()
-            w.writerows(all_rows)
+    _print_report(all_rows, out_dir if not args.dry_run else None)
+    if args.dry_run:
+        print("\ndry run -- nothing written")
+    else:
+        print(f"\nNext: python alt_models/audit_hdf5.py --dataset_dir {out_dir.parent}")
+    return 0
 
-    noted = [r for r in all_rows if r["note"]]
-    worst = sorted(all_rows, key=lambda r: -r["removed"])[:5]
-    print(f"\nmost trimmed:")
+
+def _print_report(rows, out_dir=None):
+    if not rows:
+        return
+    noted = [r for r in rows if r["note"]]
+    long_ones = [r for r in rows if r.get("read_duration_sec", 0) > 15.0]
+    worst = sorted(rows, key=lambda r: -r["removed"])[:8]
+
+    print("\nmost trimmed:")
     for r in worst:
+        dur = f"{r['read_duration_sec']:5.1f}s read" if "read_duration_sec" in r else ""
         print(f"  gid {r['global_id']:>3} {r['split']:>5} {r['bins_before']:>5} -> "
-              f"{r['bins_after']:>5} bins ({r['removed'] * 20 / 1000:.1f} s removed)")
+              f"{r['bins_after']:>5} bins  ({r['removed']*0.02:5.1f} s cut)  {dur}")
+    if long_ones:
+        print(f"\ntrials with read > 15 s ({len(long_ones)}):")
+        for r in sorted(long_ones, key=lambda r: -r["read_duration_sec"]):
+            print(f"  gid {r['global_id']:>3}  read {r['read_duration_sec']:5.1f} s -> "
+                  f"{r['bins_after']*0.02:5.1f} s kept ({r['removed']*0.02:.1f} s cut)")
     if noted:
         print(f"\n{len(noted)} trial(s) needed attention:")
         for r in noted[:20]:
             print(f"  gid {r['global_id']:>3} {r['split']:>5}: {r['note']}")
         if len(noted) > 20:
-            print(f"  ... and {len(noted) - 20} more (see {report})")
-
-    if args.dry_run:
-        print("\ndry run -- nothing written")
-    else:
-        print(f"\nWrote {out_dir}")
-        print(f"Next: python alt_models/audit_hdf5.py --dataset_dir {out_dir.parent}")
-    return 0
+            print(f"  ... and {len(noted)-20} more")
+    if out_dir is not None:
+        with open(Path(out_dir) / "trim_report.csv", "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
 
 
 if __name__ == "__main__":

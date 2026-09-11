@@ -36,6 +36,34 @@ def discover_sessions(dataset_dir: Path) -> list:
     return sessions
 
 
+def check_for_trim_duplicates(dataset_dir: Path, sessions: list) -> None:
+    """Refuse a `X` / `X_trim` pair sitting in the same dataset root.
+
+    `sessions[i]` IS the day index, so a trimmed copy next to its original gives
+    the model two day layers for one day of recordings -- and the duplicate is the
+    *untrimmed* one, so the run silently trains on the data you meant to drop.
+    Nothing about the resulting checkpoint looks wrong afterwards.
+
+    `trim_silence.py` writes to a parallel `<dataset_dir>_trim/` root to avoid
+    this; reaching it means `--out-dir` was pointed back inside, or the trim was
+    run by hand.
+    """
+    present = set(sessions)
+    clashes = sorted(name for name in present
+                     if name.endswith("_trim") and name[:-len("_trim")] in present)
+    if clashes:
+        print(
+            f"\n{dataset_dir} holds a trimmed session next to its untrimmed "
+            "original:\n", file=sys.stderr)
+        for name in clashes:
+            print(f"  {name[:-len('_trim')]}\n  {name}", file=sys.stderr)
+        print(
+            "\nBoth would be listed as separate days. Point --dataset_dir at the "
+            "trimmed root (e.g. ../data/hdf5_data_512_trim) or at the original, "
+            "not at a directory containing both.", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def describe_session(session_dir: Path) -> str:
     """Best-effort one-line summary so the user can sanity-check the day list."""
     train = session_dir / "data_train.hdf5"
@@ -118,6 +146,7 @@ def main() -> None:
     if not sessions:
         print(f"No session directories with data_train.hdf5 under {dataset_dir}", file=sys.stderr)
         raise SystemExit(1)
+    check_for_trim_duplicates(dataset_dir, sessions)
 
     cfg.dataset.sessions = sessions
     # 1 == "validate on this day" (see rnn_trainer.validation). Every day is worth

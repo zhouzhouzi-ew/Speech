@@ -211,44 +211,94 @@ writing a session whose every label is a lone `<sil>`.
 
 ### Trimming over-long silence
 
-`read_begin`/`read_end` come from the task CSV, not from the subject's voice,
-so a late marker or a long pause yields a trial that is almost entirely room
-tone. The 2026-08-14 15-05-37 session runs 3.6 s to 57.4 s per trial (median
-6.8 s), with gid 105 at 50.0 s and gid 119 at 57.4 s; day 1 has the same shape
-(gid 148 at 52.3 s). Those trials cost a disproportionate amount of memory and
-compute and teach the model nothing.
+`read_begin`/`read_end` come from the task CSV, not from the subject's voice, so
+a late marker or a long pause yields a trial that is almost entirely room tone.
+The 2026-08-14 15-05-37 session runs 3.6 s to 57.4 s per trial (median 6.8 s),
+with gid 119 at 57.4 s and gid 105 at 50.0 s; day 1 has the same shape (gid 148
+at 52.3 s, gid 100 at 52.6 s). Those trials cost a disproportionate amount of
+memory and compute and teach the model nothing.
+
+**The rule is one line: any silent run longer than `--max-silence-ms` (2 s) is
+removed.** Short pauses — the ones between words, which is what the `<sil>`
+labels describe — are left exactly as they are. The 2 s threshold is measured
+over the whole trial, edges included; there is no separate edge trimming unless
+`--edge-keep-ms` is passed explicitly.
+
+#### Two stages, because the training box has no audio
+
+The VAD needs the microphone recording, which lives with the subject data and
+not necessarily next to the HDF5. So a plan is built once where the audio is,
+and applied anywhere:
 
 ```bash
+# 1) where the audio lives -- no --session-dir means "plan only"
 python alt_models/trim_silence.py \
-    --session-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512 \
-    --audio /mnt/d/wwl/.../session-15-05-37/EnglishSpeech/microphone_audio.wav \
-    --out-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512_trim
+    --audio ../../sub-01/2026-08-14/session-15-05-37/EnglishSpeech/microphone_audio.wav \
+    --out-plan alt_models/cut_plans/2026-08-14_15-05-37.json
+
+# 2) anywhere -- replays the plan, no audio needed
+python alt_models/trim_silence.py \
+    --plan alt_models/cut_plans/2026-08-14_15-05-37.json \
+    --session-dir ../data/hdf5_data_512/t15.2026.08.14.15-05-37_tc_sbp_512
 ```
 
-Run with `--dry-run` first; it prints the full report and writes nothing. Then
-`audit_hdf5.py` the output before training. `--task-csv` defaults to the only
-`data_*.csv` sitting next to the wav.
+A plan is keyed by `global_id` and records each trial's **expected bin count**
+alongside its cut ranges, so applying it to the wrong session or to a differently
+preprocessed copy is *refused per trial* rather than silently cutting at the
+wrong offset. That check is what makes the audio-free replay trustworthy; it is
+verified below on day 1, where both paths produce identical output.
 
-It uses a 20 ms-frame VAD over the trial's own audio. Feature row `k` is at
+Passing `--audio` and `--session-dir` together does both in one shot. Run with
+`--dry-run` first; it prints the full report and writes nothing.
+
+#### Where the output goes
+
+By default to a **parallel dataset root**: `--session-dir
+<root>/<name>` writes to `<root>_trim/<name>` — same session name, different
+root. This matters, because `sessions[i]` IS the day index: a `name_trim`
+sibling inside the same root would be enumerated as a *second day*, and the
+duplicate would be the untrimmed one. `make_all_day_config.py` now refuses that
+layout outright, but the default avoids producing it. Keeping the name identical
+also means the per-trial `session` attribute needs no rewrite.
+
+```bash
+python alt_models/make_all_day_config.py --dataset_dir ../data/hdf5_data_512_trim \
+    --output alt_models/rnn_args_diphone_alldays.yaml --day_calibration hammer_scalpel
+```
+
+#### How it decides
+
+A 20 ms-frame VAD runs over the trial's own audio. Feature row `k` is at
 `read_begin + k*20 ms` — checked against all 189 day-1 trials, where
 `n_time_steps == floor(read_duration_sec * 50)` exactly — and sample 0 of the
-wav is the CSV's `mic_start` event. The threshold is set from the trial's own
-percentiles (`p95 - 22 dB`, floored at `p20 + 20 dB`) rather than an absolute
-level, because room tone here ranges over 15–35 dB between sessions. A trial
-with under 15 dB of speech-to-noise contrast is left untouched and reported.
+wav is the CSV's `mic_start` event. The speech threshold is set from the trial's
+own percentiles (`p95 - 22 dB`, floored at `p20 + 20 dB`) rather than an absolute
+level, because room tone here ranges over 15–35 dB between sessions. A trial with
+under 15 dB of speech-to-noise contrast is left untouched and reported.
 
-Leading and trailing silence is capped at `--edge-keep-ms`; silent runs longer
-than `--max-silence-ms` are collapsed to `--keep-silence-ms`, so the pause stays
-visible as a pause instead of vanishing.
+**`seq_class_ids` is never modified.** CTC sums over alignment paths, so it needs
+no frame-level alignment — removing input frames cannot invalidate the transcript
+provided at least `L` frames remain. The script enforces that and reports any
+trial where it had to clamp.
 
-**`seq_class_ids` is never modified.** CTC sums over alignment paths, so it
-needs no frame-level alignment — removing input frames cannot invalidate the
-transcript provided at least `L` frames remain. The script enforces that and
-reports any trial where it had to clamp. On day 1 it removes 39 % of all frames
-while retaining **100 % of the frames the VAD called speech**, on all 189
-trials.
+#### Verified numbers
 
-> Trim every day with the same flags. A model trained on trimmed day 2 and
+On day 1, at `--max-silence-ms 2000`, the audio path and the plan path agree
+exactly:
+
+| | trials | bins | removed |
+|---|---|---|---|
+| train | 153 | 55 745 → 48 495 | 13.0 % |
+| val | 18 | 8 812 → 6 385 | 27.5 % |
+| test | 18 | 6 001 → 5 084 | 15.3 % |
+
+**100 % of the frames the VAD called speech survive, on all 189 trials**, and the
+output passes `audit_hdf5.py` unchanged. At this threshold only 60 of 189 trials
+are touched at all — the bulk of the removal is a handful of pathological trials
+rather than a shaving of every pause. On the 15-05-37 session the plan matches
+MATLAB's own count of trials over 15 s (two: gid 105 and gid 119).
+
+> Trim every day at the same threshold. A model trained on trimmed day 2 and
 > untrimmed day 1 is being asked to reconcile two input distributions on top of
 > the day difference it is meant to be learning.
 
