@@ -56,6 +56,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `train_diphone.py` / `evaluate_diphone.py` | entry points, siblings of `train_model.py` / `evaluate_model.py`. |
 | `rnn_args_diphone.yaml` | config (English 512D, copy task). |
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
+| `check_config.py` | pre-flight for the `sessions:` block — catches the silent one-day failure. |
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
@@ -110,6 +111,30 @@ python alt_models/evaluate_diphone.py \
     --eval_type test --skip_lm \
     --output_prefix diphone_rnn
 ```
+
+### Always run the pre-flight first
+
+A wrong `sessions:` list fails **silently**. Nothing scans `dataset_dir` —
+`rnn_trainer.py:163` builds `<dataset_dir>/<session>/data_train.hdf5` straight
+from the list — so a forgotten day, a typo'd directory, or a
+`dataset_probability_val:` of the wrong length all produce a run that starts
+fine, trains fine, and reports a PER for the wrong dataset. There is no error to
+read afterwards.
+
+```bash
+python alt_models/check_config.py alt_models/rnn_args_diphone_alldays.yaml
+```
+
+It verifies every session directory exists with `data_train.hdf5` and
+`data_val.hdf5`, that `dataset_probability_val` matches `sessions` in length,
+that the order is chronological (list position *is* the day index), and exits
+non-zero on any problem, so it chains:
+
+```bash
+python alt_models/check_config.py rnn_args.yaml && python train_model.py rnn_args.yaml
+```
+
+It works on any config in this repo, not just the diphone ones.
 
 ### All days
 
