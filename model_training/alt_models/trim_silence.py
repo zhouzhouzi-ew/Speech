@@ -282,21 +282,28 @@ def process_split(path: Path, out_path: Path, plan: dict, args, write: bool,
             gid = int(np.asarray(g.attrs["global_id"]).reshape(-1)[0])
             n_ids = len(g["seq_class_ids"][:])
 
+            # `refused` means "this trial could not be trimmed as planned". The
+            # trial itself is still written, untouched, so the session stays
+            # structurally complete -- but the run must not report success, or a
+            # systematically misaligned plan would pass for a clean job.
             row = {"split": path.stem.replace("data_", ""), "trial": key,
                    "global_id": gid, "bins_before": n_bins, "n_labels": n_ids,
-                   "bins_after": n_bins, "removed": 0, "note": ""}
+                   "bins_after": n_bins, "removed": 0, "note": "", "refused": False}
 
             entry = plan["trials"].get(str(gid))
             keep = np.ones(n_bins, dtype=bool)
             if entry is None:
+                row["refused"] = True
                 row["note"] = "global_id absent from the cut plan -- left untouched"
             elif entry["n_bins"] != n_bins:
+                row["refused"] = True
                 row["note"] = (f"plan expects {entry['n_bins']} bins but this trial "
                                f"has {n_bins} -- REFUSED (frames would misalign)")
             else:
                 for a, b in entry["cut"]:
                     keep[a:b] = False
                 if int(keep.sum()) < n_ids:
+                    row["refused"] = True
                     row["note"] = (f"plan would leave {int(keep.sum())} < {n_ids} "
                                    "labels -- left untouched")
 
@@ -466,6 +473,13 @@ def main() -> int:
         print("\ndry run -- nothing written")
     else:
         print(f"\nNext: python alt_models/audit_hdf5.py --dataset_dir {out_dir.parent}")
+
+    refused = [r for r in all_rows if r.get("refused")]
+    if refused:
+        print(f"\n{len(refused)} trial(s) were NOT trimmed as planned (see the "
+              "notes above). The cut plan does not line up with this session -- "
+              "do not train on this output.", file=sys.stderr)
+        return 1
     return 0
 
 

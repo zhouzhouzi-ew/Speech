@@ -58,11 +58,13 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `make_all_day_config.py` | generates the multi-day `sessions:` / `dataset_probability_val:` block. |
 | `check_config.py` | pre-flight for the `sessions:` block — catches the silent one-day failure. |
 | `install_matlab_session.py` | installs a MATLAB `data_*.hdf5` folder as a session; reconciles the dir-name/attr split and supplies `metadata.json`. |
-| `trim_silence.py` | drops over-long silent stretches from a session, using the session's microphone audio. |
+| `trim_silence.py` | drops silent runs longer than 2 s; `--out-plan` / `--plan` make it runnable without the audio. |
+| `cut_plans/` | precomputed cut plans for both 2026-08-14 sessions, keyed by `global_id`. |
+| `CUT_AND_TRAIN_RUNBOOK.md` | end-to-end: pull → install → trim → audit → train → PER/WER. |
 | `h5py_compat.py` | fixes a pre-existing numpy-2 bug in the *shared* eval helpers (see below). |
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
-| `tests/test_trim_silence.py` | 13 tests: keep-planning, adaptive VAD, real-data speech retention. |
+| `tests/test_trim_silence.py` | 14 tests: keep-planning, adaptive VAD, real-data speech retention. |
 
 Two config keys in the `model:` block select among four model classes:
 
