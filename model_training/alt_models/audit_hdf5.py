@@ -44,7 +44,11 @@ def _scalar(value):
     return int(np.asarray(value).reshape(-1)[0])
 
 
-def audit_session(session_dir: Path, max_trials: int | None = None) -> list:
+def audit_session(
+    session_dir: Path,
+    max_trials: int | None = None,
+    n_features: int = N_FEATURES,
+) -> list:
     problems = []
     name = session_dir.name
 
@@ -94,10 +98,10 @@ def audit_session(session_dir: Path, max_trials: int | None = None) -> list:
                     continue
 
                 feats = g["input_features"]
-                if feats.ndim != 2 or feats.shape[1] != N_FEATURES:
+                if feats.ndim != 2 or feats.shape[1] != n_features:
                     problems.append(
                         f"{name}/{split}/{key}: input_features shape {feats.shape}, "
-                        f"expected (T, {N_FEATURES})"
+                        f"expected (T, {n_features})"
                     )
                 elif feats.dtype != np.float32:
                     problems.append(
@@ -160,6 +164,16 @@ def main() -> int:
     parser.add_argument("--dataset_dir", type=str, default="../data/hdf5_data_512")
     parser.add_argument("--max_trials", type=int, default=None,
                         help="check only the first N trials per split (faster)")
+    parser.add_argument(
+        "--n_features",
+        type=int,
+        default=N_FEATURES,
+        help=(
+            "expected width of `input_features`. 512 is the TC+SBP contract this "
+            "auditor was written for; the 2026-09 spike-only sessions have no NS6 "
+            "behind them, so they are TC-only and must be audited with 256."
+        ),
+    )
     args = parser.parse_args()
 
     root = Path(args.dataset_dir)
@@ -175,7 +189,7 @@ def main() -> int:
     print(f"Auditing {len(sessions)} session(s) under {root}\n")
     all_problems = []
     for session_dir in sessions:
-        all_problems.extend(audit_session(session_dir, args.max_trials))
+        all_problems.extend(audit_session(session_dir, args.max_trials, args.n_features))
 
     print()
     if all_problems:
