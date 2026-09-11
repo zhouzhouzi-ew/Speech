@@ -55,6 +55,7 @@ import h5py
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audit_hdf5 import audit_session  # noqa: E402
+from build_hdf5_from_mat import PHONEME_TO_ID  # noqa: E402
 
 SPLITS = ("train", "val", "test")
 CARRY_OVER = (
@@ -106,34 +107,44 @@ def resolve_metadata(source: Path, dataset_dir: Path, session_name: str,
     """Find a metadata.json carrying `labels.phoneme_to_id`.
 
     Order: the one named on the command line, then the source dir's own, then
-    any session already installed under `dataset_dir`. The vocabulary is a fixed
-    property of the corpus, so borrowing it from another session is correct --
-    but borrowing is only safe because `audit_hdf5` re-encodes every label
-    against this exact map afterwards.
+    anything already installed under `dataset_dir` (including a same-named
+    session being reinstalled). The vocabulary is a fixed property of the
+    corpus, so borrowing it from another session is correct -- but borrowing is
+    only safe because `audit_hdf5` re-encodes every label against this exact map
+    afterwards.
+
+    Returns `(meta, path)` on success, or `(None, [reason, ...])` -- the reasons
+    are the whole point: "not found" without saying where it looked is what makes
+    a wrong `--metadata-from` path indistinguishable from a file that is present
+    but missing the key.
     """
     candidates = []
     if metadata_from is not None:
         candidates.append(Path(metadata_from) / "metadata.json"
                           if Path(metadata_from).is_dir() else Path(metadata_from))
     candidates.append(source / "metadata.json")
+    dataset_dir = Path(dataset_dir)
     if dataset_dir.is_dir():
         candidates.extend(sorted(
             p / "metadata.json"
             for p in dataset_dir.iterdir()
-            if p.is_dir() and p.name != session_name
+            if p.is_dir()
         ))
 
+    rejected = []
     for path in candidates:
         if not path.exists():
+            rejected.append(f"{path}: no such file")
             continue
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            rejected.append(f"{path}: unreadable ({type(exc).__name__}: {exc})")
             continue
-        labels = meta.get("labels", {})
-        if labels.get("phoneme_to_id"):
+        if (meta.get("labels") or {}).get("phoneme_to_id"):
             return meta, path
-    return None, None
+        rejected.append(f"{path}: has no labels.phoneme_to_id")
+    return None, rejected
 
 
 def install(source: Path, dataset_dir: Path, session_name: str | None,
@@ -164,6 +175,27 @@ def install(source: Path, dataset_dir: Path, session_name: str | None,
     dest = dataset_dir / session_name
     if dest.exists() and not overwrite:
         raise SystemExit(f"{dest} already exists. Pass --overwrite to replace it.")
+
+    # Resolve the vocabulary BEFORE touching `dest`: the rmtree below is
+    # unconditional, so anything that can fail has to fail first. It used to run
+    # after, which meant a bad `--metadata-from` destroyed a working session and
+    # left a half-built one in its place.
+    meta, found = resolve_metadata(source, dataset_dir, session_name, metadata_from)
+    if meta is None:
+        # Nothing on this machine could supply the vocabulary. The 35-class map
+        # is a fixed property of the corpus, and `audit_session` re-encodes every
+        # label against exactly this constant at the end of the install, so
+        # writing it here is not a guess -- but it does mean nothing on this box
+        # could cross-check it, so say so rather than passing quietly.
+        detail = "\n".join(f"      - {r}" for r in found) or "      (nothing to try)"
+        print("  WARNING: no metadata.json found anywhere on this machine:\n"
+              f"{detail}\n"
+              "           Writing the built-in 35-class vocabulary instead. The "
+              "audit below\n"
+              "           still re-encodes every label against it.")
+        meta = {"labels": {"phoneme_to_id": dict(PHONEME_TO_ID)}}
+        found = "built-in PHONEME_TO_ID"
+
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -188,17 +220,10 @@ def install(source: Path, dataset_dir: Path, session_name: str | None,
             shutil.copy2(source / name, dest / name)
             print(f"  carried over {name}")
 
-    meta, origin = resolve_metadata(source, dataset_dir, session_name, metadata_from)
-    if meta is None:
-        raise SystemExit(
-            "could not find a metadata.json with labels.phoneme_to_id. Pass "
-            "--metadata-from pointing at a session that has one (e.g. the day-1 "
-            "directory); evaluation needs it to map logits back to phonemes."
-        )
     meta["session"] = session_name
     (dest / "metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"  metadata.json <- {origin}")
+    print(f"  metadata.json <- {found}")
 
     print(f"\nInstalled {total} trials at {dest}\n")
     problems = audit_session(dest)

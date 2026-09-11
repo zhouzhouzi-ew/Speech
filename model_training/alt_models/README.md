@@ -65,6 +65,7 @@ Head grows from 768×35 to 768×1157 (≈ +0.86 M params).
 | `tests/test_diphone.py` | 22 correctness tests, incl. real-trial CTC feasibility. |
 | `tests/test_day_calibration.py` | 12 tests: identity-at-init, gate behaviour, param groups, registry. |
 | `tests/test_trim_silence.py` | 16 tests: keep-planning, adaptive VAD, real-data speech retention, session-stamp invariant. |
+| `tests/test_install_matlab_session.py` | 6 tests: metadata resolution and its diagnostics, attr rewrite, real-split install with no vocabulary on the box. |
 
 Two config keys in the `model:` block select among four model classes:
 
@@ -414,8 +415,11 @@ edit touches a shared file, so it was left out of this folder on purpose.
 
 ```bash
 cd Speech/model_training
-python alt_models/tests/test_diphone.py          # 22 tests
-python alt_models/tests/test_day_calibration.py  # 12 tests
+python alt_models/tests/test_diphone.py                # 22 tests
+python alt_models/tests/test_day_calibration.py        # 12 tests
+python alt_models/tests/test_build_hdf5_from_mat.py    # 11 tests
+python alt_models/tests/test_trim_silence.py           # 16 tests
+python alt_models/tests/test_install_matlab_session.py #  6 tests
 # or: python -m pytest alt_models/tests -v
 ```
 

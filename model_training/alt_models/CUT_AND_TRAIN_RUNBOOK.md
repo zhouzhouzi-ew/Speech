@@ -80,6 +80,11 @@ python alt_models/install_matlab_session.py \
     --overwrite
 ```
 
+If that box has no `metadata.json` anywhere, the installer says so and writes
+the built-in 35-class vocabulary instead — the audit that follows re-encodes
+every label against exactly that map, so the session is still verified. Read the
+warning rather than skipping past it.
+
 **Or just proceed to step 3.** The trimmer stamps its output with the name of
 the directory it writes into, so `hdf5_data_512_trim/` is clean whichever way
 you got there — training and evaluation read only that root. The stale source is
